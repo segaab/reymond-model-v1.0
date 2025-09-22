@@ -91,8 +91,8 @@ st.sidebar.header("Breadth & Sweep")
 run_breadth   = st.sidebar.button("Run breadth modes")
 run_sweep_btn = st.sidebar.button("Run grid sweep")
 
-rr_vals       = st.sidebar.multiselect("RR values", [1.5,2.0,2.5,3.0], default=[2.0,3.0])
-sl_ranges_raw = st.sidebar.text_input("SL ranges", "0.5-1.0,1.0-2.0")
+rr_vals       = st.sidebar.multiselect("RR values", [1.5,2.0,2.5,3.0,3.5, 4.0,4.5,5.0,5.5,6.0,6.5,7.0], default=[2.0,3.0,3.5, 4.0,4.5,5.0,5.5,6.0,6.5,7.0])
+sl_ranges_raw = st.sidebar.text_input("SL ranges", "0.5-1.0,1.0-2.0,2.0-4.0")
 session_modes = st.sidebar.multiselect("Session modes", ["low","mid","high"],
                                        default=["low","mid","high"])
 mpt_input     = st.sidebar.text_input("Model prob thresholds", "0.6,0.7")
