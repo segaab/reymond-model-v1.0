@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy
+yahooquery
+sodapy
+xgboost
+scikit-learn
+matplotlib
+seaborn
+joblib
+python-dateutil
+tqdm
+supabase
+python-dotenv
+torch
