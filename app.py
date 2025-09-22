@@ -80,8 +80,8 @@ early_stop = int(st.sidebar.number_input("XGBoost early_stop", 1, value=20))
 test_size = float(st.sidebar.number_input("Test size fraction", 0.0, 1.0, 0.2))
 
 p_fast = st.sidebar.number_input("Threshold fast (prob)", 0.0, 1.0, 0.60)
-p_slow = st.sidebar.number_input("Threshold slow (prob)", 0.0, 1.0, 0.55)
-p_deep = st.sidebar.number_input("Threshold deep (prob)", 0.0, 1.0, 0.45)
+p_slow = st.sidebar.number_input("Threshold slow (prob)", 0.0, 1.0, 0.50)
+p_deep = st.sidebar.number_input("Threshold deep (prob)", 0.0, 1.0, 0.40)
 
 force_run = st.sidebar.checkbox("Force run even if HealthGauge not in band", value=False)
 show_confusion = st.sidebar.checkbox("Show confusion matrix", value=True)
@@ -93,8 +93,8 @@ run_breadth = st.sidebar.button("Run breadth modes")
 run_sweep_btn = st.sidebar.button("Run grid sweep")
 
 # breadth/sweep params
-rr_vals = st.sidebar.multiselect("RR values", [1.0,1.5,2.0,2.5,3.0], default=[2.0,3.0])
-sl_ranges_txt = st.sidebar.text_input("SL ranges (comma list like 0.5-1.0,1.0-2.0)", "0.5-1.0,1.0-2.0")
+rr_vals = st.sidebar.multiselect("RR values", [1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0], default=[2.0,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0])
+sl_ranges_txt = st.sidebar.text_input("SL ranges (comma list like 0.5-1.0,1.0-2.0)", "0.5-1.0,1.0-2.0,2.0-3.0,3.0-4.0")
 max_bars = int(st.sidebar.number_input("Max bars horizon", 1, value=60))
 
 def parse_sl_ranges(txt: str) -> List[Tuple[float,float]]:
@@ -336,9 +336,9 @@ def run_breadth_backtest(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = 
         return results
 
     modes = {
-        "low": {"sell_th": 5, "buy_th": 5},
+        "low": {"sell_th": 4.5, "buy_th": 5.5},
         "mid": {"sell_th": 4, "buy_th": 6},
-        "high": {"sell_th": 3, "buy_th": 7}
+        "high": {"sell_th": 3.5, "buy_th":6.5}
     }
     for mode, th in modes.items():
         try:
