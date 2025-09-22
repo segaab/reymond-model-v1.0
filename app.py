@@ -67,7 +67,7 @@ st.title("Entry-Range Triangulation Dashboard — Integrated")
 
 # ---- UI controls
 symbol = st.text_input("Symbol", value="GC=F")
-start_date = st.date_input("Start date", value=datetime.today() - timedelta(days=30))
+start_date = st.date_input("Start date", value=datetime.today() - timedelta(days=365))
 end_date = st.date_input("End date", value=datetime.today())
 interval = st.selectbox("Interval", ["1m", "5m", "15m", "1h", "1d"], index=4)
 
