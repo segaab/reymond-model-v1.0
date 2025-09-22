@@ -1,3 +1,268 @@
+# app.py — Entry-Range Triangulation (integrated single-file)
+# Chunk 1/7: imports + Streamlit UI + basic config
+import os
+import io
+import math
+import time
+import uuid
+import json
+import joblib
+import logging
+import traceback
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Tuple, Dict, Any, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+from dataclasses import dataclass
+
+from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
+                             confusion_matrix, classification_report)
+from sklearn.model_selection import train_test_split
+
+# optional third-party imports (defensive)
+try:
+    from sodapy import Socrata
+except Exception:
+    Socrata = None
+try:
+    from yahooquery import Ticker as YahooTicker
+except Exception:
+    YahooTicker = None
+try:
+    from supabase import create_client, Client
+except Exception:
+    create_client = None
+    Client = None
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+except Exception:
+    torch = None
+    nn = None
+    optim = None
+    DataLoader = None
+    TensorDataset = None
+
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("entry_triangulation_app")
+logger.setLevel(logging.INFO)
+
+# Streamlit page config
+st.set_page_config(page_title="Entry-Range Triangulation Dashboard", layout="wide")
+st.title("Entry-Range Triangulation Dashboard — Integrated")
+
+# Chunk 2/7: UI controls, Asset dataclass, fetch + feature helpers
+
+# ---- UI controls
+symbol = st.text_input("Symbol", value="GC=F")
+start_date = st.date_input("Start date", value=datetime.today() - timedelta(days=30))
+end_date = st.date_input("End date", value=datetime.today())
+interval = st.selectbox("Interval", ["1m", "5m", "15m", "1h", "1d"], index=4)
+
+# thresholds and model params
+buy_threshold = st.sidebar.number_input("Buy threshold (HealthGauge)", 0.0, 1.0, 0.55)
+sell_threshold = st.sidebar.number_input("Sell threshold (HealthGauge)", 0.0, 1.0, 0.45)
+
+num_boost = int(st.sidebar.number_input("XGBoost rounds", 1, value=200))
+early_stop = int(st.sidebar.number_input("XGBoost early_stop", 1, value=20))
+test_size = float(st.sidebar.number_input("Test size fraction", 0.0, 1.0, 0.2))
+
+p_fast = st.sidebar.number_input("Threshold fast (prob)", 0.0, 1.0, 0.60)
+p_slow = st.sidebar.number_input("Threshold slow (prob)", 0.0, 1.0, 0.55)
+p_deep = st.sidebar.number_input("Threshold deep (prob)", 0.0, 1.0, 0.45)
+
+force_run = st.sidebar.checkbox("Force run even if HealthGauge not in band", value=False)
+show_confusion = st.sidebar.checkbox("Show confusion matrix", value=True)
+overlay_entries_on_price = st.sidebar.checkbox("Overlay entries on price", value=True)
+include_health_as_feature = st.sidebar.checkbox("Include HealthGauge as feature", value=True)
+save_feature_importance = st.sidebar.checkbox("Save feature importance on export", value=True)
+
+run_breadth = st.sidebar.button("Run breadth modes")
+run_sweep_btn = st.sidebar.button("Run grid sweep")
+
+# breadth/sweep params
+rr_vals = st.sidebar.multiselect("RR values", [1.0,1.5,2.0,2.5,3.0], default=[2.0,3.0])
+sl_ranges_txt = st.sidebar.text_input("SL ranges (comma list like 0.5-1.0,1.0-2.0)", "0.5-1.0,1.0-2.0")
+max_bars = int(st.sidebar.number_input("Max bars horizon", 1, value=60))
+
+def parse_sl_ranges(txt: str) -> List[Tuple[float,float]]:
+    out = []
+    for s in (p.strip() for p in txt.split(",") if p.strip()):
+        try:
+            a,b = s.split("-")
+            out.append((float(a), float(b)))
+        except Exception:
+            continue
+    return out
+
+sl_ranges = parse_sl_ranges(sl_ranges_txt)
+
+# ---- Asset dataclass
+@dataclass
+class Asset:
+    name: str
+    cot_name: str
+    symbol: str
+    rvol_lookback: int = 20
+    atr_lookback: int = 14
+
+asset_obj = Asset(name="Gold", cot_name="GOLD - COMMODITY EXCHANGE INC.", symbol=symbol)
+
+# ---- Data fetcher using yahooquery (defensive)
+def fetch_price(symbol: str, start: Optional[str], end: Optional[str], interval: str = "1d") -> pd.DataFrame:
+    if YahooTicker is None:
+        logger.error("yahooquery not installed. Install via `pip install yahooquery`.")
+        return pd.DataFrame()
+    try:
+        t = YahooTicker(symbol)
+        raw = t.history(start=start, end=end, interval=interval)
+        # yahooquery sometimes returns MultiIndex or dict
+        if isinstance(raw, dict):
+            raw = pd.DataFrame(raw)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        if isinstance(raw.index, pd.MultiIndex):
+            raw = raw.reset_index(level=0, drop=True)
+        raw.index = pd.to_datetime(raw.index)
+        raw = raw.sort_index()
+        # normalize column names
+        raw.columns = [c.lower() for c in raw.columns]
+        if "close" not in raw.columns and "adjclose" in raw.columns:
+            raw["close"] = raw["adjclose"]
+        return raw[~raw.index.duplicated()]
+    except Exception as e:
+        logger.error("fetch_price failed: %s", e)
+        return pd.DataFrame()
+
+# ---- Features
+def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
+    if "volume" not in df.columns:
+        return pd.Series(1.0, index=df.index)
+    rolling_avg = df["volume"].rolling(window=lookback, min_periods=1).mean()
+    rvol = (df["volume"] / rolling_avg.replace(0, np.nan)).fillna(1.0)
+    return rvol
+
+def calculate_health_gauge(cot_df: pd.DataFrame, daily_bars: pd.DataFrame, threshold: float = 1.5) -> pd.DataFrame:
+    if daily_bars is None or daily_bars.empty:
+        return pd.DataFrame()
+    db = daily_bars.copy()
+    db["rvol"] = compute_rvol(db)
+    score = (db["rvol"] >= threshold).astype(float)
+    return pd.DataFrame({"health_gauge": score}, index=db.index)
+
+def ensure_no_duplicate_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return df
+    if df.index.duplicated().any():
+        df = df[~df.index.duplicated(keep="first")]
+    return df.sort_index()
+
+# Chunk 3/7: labeling / generate_candidates_and_labels
+def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1).fillna(close.iloc[0])
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+def generate_candidates_and_labels(
+    bars: pd.DataFrame,
+    lookback: int = 64,
+    k_tp: float = 3.0,
+    k_sl: float = 1.0,
+    atr_window: int = 14,
+    max_bars: int = 60,
+    direction: str = "long",
+) -> pd.DataFrame:
+    """
+    Generate candidates with ATR-based SL/TP + triple-barrier-like labeling.
+    Returns DataFrame with candidate_time, entry_price, atr, sl_price, tp_price, end_time, label, duration, realized_return, direction
+    """
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+
+    df = bars.copy()
+    df.index = pd.to_datetime(df.index)
+    df = ensure_no_duplicate_index(df)
+
+    # ensure required columns
+    for c in ("high", "low", "close"):
+        if c not in df.columns:
+            raise KeyError(f"Missing column {c} in bars")
+
+    df["tr"] = _true_range(df["high"], df["low"], df["close"])
+    df["atr"] = df["tr"].rolling(window=atr_window, min_periods=1).mean().fillna(method="ffill").fillna(0.0)
+
+    records = []
+    n = len(df)
+    for i in range(lookback, n):
+        t = df.index[i]
+        entry_price = float(df["close"].iat[i])
+        atr_t = float(df["atr"].iat[i])
+        if atr_t <= 0 or math.isnan(atr_t):
+            continue
+
+        if direction == "long":
+            sl_price = entry_price - k_sl * atr_t
+            tp_price = entry_price + k_tp * atr_t
+        else:
+            sl_price = entry_price + k_sl * atr_t
+            tp_price = entry_price - k_tp * atr_t
+
+        end_idx = min(i + max_bars, n - 1)
+        label = 0
+        hit_idx = end_idx
+        hit_price = float(df["close"].iat[end_idx])
+
+        for j in range(i + 1, end_idx + 1):
+            px_high = float(df["high"].iat[j])
+            px_low = float(df["low"].iat[j])
+            if direction == "long":
+                if px_high >= tp_price:
+                    label, hit_idx, hit_price = 1, j, tp_price
+                    break
+                if px_low <= sl_price:
+                    label, hit_idx, hit_price = 0, j, sl_price
+                    break
+            else:
+                if px_low <= tp_price:
+                    label, hit_idx, hit_price = 1, j, tp_price
+                    break
+                if px_high >= sl_price:
+                    label, hit_idx, hit_price = 0, j, sl_price
+                    break
+
+        end_time = df.index[hit_idx]
+        realized_return = (hit_price - entry_price) / entry_price if direction == "long" else (entry_price - hit_price) / entry_price
+        dur_min = (end_time - t).total_seconds() / 60.0
+
+        rec = {
+            "candidate_time": t,
+            "entry_price": entry_price,
+            "atr": atr_t,
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            "end_time": end_time,
+            "label": int(label),
+            "duration": float(dur_min),
+            "realized_return": float(realized_return),
+            "direction": direction
+        }
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
 # Chunk 4/7: simulate_limits, breadth backtest, sweep
 def simulate_limits(
     df: pd.DataFrame,
