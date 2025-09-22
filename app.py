@@ -6,6 +6,7 @@ import math
 import time
 import uuid
 import json
+import pandas as pd
 import joblib
 import logging
 import traceback
