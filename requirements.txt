@@ -13,3 +13,6 @@ tqdm
 supabase
 python-dotenv
 torch
+
+requests
+sqlalchemy
