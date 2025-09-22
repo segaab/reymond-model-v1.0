@@ -1,12 +1,12 @@
 # app.py — Entry-Range Triangulation (integrated single-file)
-# Chunk 1/7: imports + Streamlit UI + basic config
+# Chunk 1/7: imports + Streamlit UI + level configs + data fetcher
+
 import os
 import io
 import math
 import time
 import uuid
 import json
-import pandas as pd
 import joblib
 import logging
 import traceback
@@ -20,382 +20,307 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from dataclasses import dataclass
 
-from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
-                             confusion_matrix, classification_report)
+# ML / metrics
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 from sklearn.model_selection import train_test_split
 
-# optional third-party imports (defensive)
-try:
-    from sodapy import Socrata
-except Exception:
-    Socrata = None
+# Optional libs (graceful degradation)
 try:
     from yahooquery import Ticker as YahooTicker
 except Exception:
     YahooTicker = None
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
 try:
     from supabase import create_client, Client
 except Exception:
     create_client = None
     Client = None
 try:
-    import xgboost as xgb
-except Exception:
-    xgb = None
-try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
-    from torch.utils.data import DataLoader, TensorDataset
 except Exception:
     torch = None
-    nn = None
-    optim = None
-    DataLoader = None
-    TensorDataset = None
 
-# logging
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("entry_triangulation_app")
 logger.setLevel(logging.INFO)
 
-# Streamlit page config
-st.set_page_config(page_title="Entry-Range Triangulation Dashboard", layout="wide")
-st.title("Entry-Range Triangulation Dashboard — Integrated")
+# ---------------------------
+# Streamlit page & UI inputs
+# ---------------------------
+st.set_page_config(page_title="Entry-Range Triangulation", layout="wide")
+st.title("Entry-Range Triangulation Dashboard — Multi-level (3) Models")
 
-# Chunk 2/7: UI controls, Asset dataclass, fetch + feature helpers
-
-# ---- UI controls
-symbol = st.text_input("Symbol", value="GC=F")
-start_date = st.date_input("Start date", value=datetime.today() - timedelta(days=365))
+# Basic symbol/time inputs
+symbol = st.text_input("Symbol (Yahoo)", value="GC=F")
+start_date = st.date_input("Start date", value=datetime.today() - timedelta(days=90))
 end_date = st.date_input("End date", value=datetime.today())
-interval = st.selectbox("Interval", ["1m", "5m", "15m", "1h", "1d"], index=4)
+interval = st.selectbox("Interval", ["1d", "1h", "15m", "5m", "1m"], index=0)
 
-# thresholds and model params
-buy_threshold = st.sidebar.number_input("Buy threshold (HealthGauge)", 0.0, 1.0, 0.55)
-sell_threshold = st.sidebar.number_input("Sell threshold (HealthGauge)", 0.0, 1.0, 0.45)
+# HealthGauge gating
+st.sidebar.header("HealthGauge")
+buy_threshold_global = st.sidebar.number_input("Global buy threshold", 0.0, 10.0, 5.5)
+sell_threshold_global = st.sidebar.number_input("Global sell threshold", 0.0, 10.0, 4.5)
+force_run = st.sidebar.checkbox("Force run even if gating fails", value=False)
 
-num_boost = int(st.sidebar.number_input("XGBoost rounds", 1, value=200))
-early_stop = int(st.sidebar.number_input("XGBoost early_stop", 1, value=20))
-test_size = float(st.sidebar.number_input("Test size fraction", 0.0, 1.0, 0.2))
+# XGBoost / training
+st.sidebar.header("Training")
+num_boost = int(st.sidebar.number_input("XGBoost rounds", min_value=1, value=200))
+early_stop = int(st.sidebar.number_input("Early stopping rounds", min_value=1, value=20))
+test_size = float(st.sidebar.number_input("Validation fraction", min_value=0.01, max_value=0.5, value=0.2))
 
-p_fast = st.sidebar.number_input("Threshold fast (prob)", 0.0, 1.0, 0.60)
-p_slow = st.sidebar.number_input("Threshold slow (prob)", 0.0, 1.0, 0.50)
-p_deep = st.sidebar.number_input("Threshold deep (prob)", 0.0, 1.0, 0.40)
+# Thresholds for confirm stage
+p_fast = st.sidebar.number_input("Confirm threshold (fast)", 0.0, 1.0, 0.60)
+p_slow = st.sidebar.number_input("Confirm threshold (slow)", 0.0, 1.0, 0.55)
+p_deep = st.sidebar.number_input("Confirm threshold (deep)", 0.0, 1.0, 0.45)
 
-force_run = st.sidebar.checkbox("Force run even if HealthGauge not in band", value=False)
-show_confusion = st.sidebar.checkbox("Show confusion matrix", value=True)
-overlay_entries_on_price = st.sidebar.checkbox("Overlay entries on price", value=True)
-include_health_as_feature = st.sidebar.checkbox("Include HealthGauge as feature", value=True)
-save_feature_importance = st.sidebar.checkbox("Save feature importance on export", value=True)
+# Level-specific configs (user requested)
+st.sidebar.header("Level 1 (Scope)")
+lvl1_buy = st.sidebar.number_input("L1 buy threshold (signal)", 0.0, 10.0, 5.5, step=0.1)
+lvl1_sell = st.sidebar.number_input("L1 sell threshold (signal)", 0.0, 10.0, 4.5, step=0.1)
+lvl1_rr_min = st.sidebar.number_input("L1 RR min", 0.1, 10.0, 1.0, step=0.1)
+lvl1_rr_max = st.sidebar.number_input("L1 RR max", 0.1, 10.0, 2.5, step=0.1)
+lvl1_sl_min = st.sidebar.number_input("L1 SL min (pct)", 0.001, 0.5, 0.02, step=0.001)
+lvl1_sl_max = st.sidebar.number_input("L1 SL max (pct)", 0.001, 0.5, 0.04, step=0.001)
 
-run_breadth = st.sidebar.button("Run breadth modes")
+st.sidebar.header("Level 2 (Focus)")
+lvl2_buy = st.sidebar.number_input("L2 buy threshold (signal)", 0.0, 10.0, 6.0, step=0.1)
+lvl2_sell = st.sidebar.number_input("L2 sell threshold (signal)", 0.0, 10.0, 4.0, step=0.1)
+lvl2_rr_min = st.sidebar.number_input("L2 RR min", 0.1, 10.0, 2.0, step=0.1)
+lvl2_rr_max = st.sidebar.number_input("L2 RR max", 0.1, 10.0, 3.5, step=0.1)
+lvl2_sl_min = st.sidebar.number_input("L2 SL min (pct)", 0.001, 0.5, 0.01, step=0.001)
+lvl2_sl_max = st.sidebar.number_input("L2 SL max (pct)", 0.001, 0.5, 0.03, step=0.001)
+
+st.sidebar.header("Level 3 (Triangulation)")
+lvl3_buy = st.sidebar.number_input("L3 buy threshold (signal)", 0.0, 10.0, 6.5, step=0.1)
+lvl3_sell = st.sidebar.number_input("L3 sell threshold (signal)", 0.0, 10.0, 3.5, step=0.1)
+lvl3_rr_min = st.sidebar.number_input("L3 RR min", 0.1, 10.0, 3.0, step=0.1)
+lvl3_rr_max = st.sidebar.number_input("L3 RR max", 0.1, 10.0, 5.0, step=0.1)
+lvl3_sl_min = st.sidebar.number_input("L3 SL min (pct)", 0.001, 0.5, 0.005, step=0.001)
+lvl3_sl_max = st.sidebar.number_input("L3 SL max (pct)", 0.001, 0.5, 0.02, step=0.001)
+
+# Breadth & sweep controls
+st.sidebar.header("Breadth & Sweep")
+run_breadth = st.sidebar.button("Run breadth backtest (3 levels)")
 run_sweep_btn = st.sidebar.button("Run grid sweep")
 
-# breadth/sweep params
-rr_vals = st.sidebar.multiselect("RR values", [1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0], default=[2.0,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0])
-sl_ranges_txt = st.sidebar.text_input("SL ranges (comma list like 0.5-1.0,1.0-2.0)", "0.5-1.0,1.0-2.0,2.0-3.0,3.0-4.0")
-max_bars = int(st.sidebar.number_input("Max bars horizon", 1, value=60))
-
-def parse_sl_ranges(txt: str) -> List[Tuple[float,float]]:
-    out = []
-    for s in (p.strip() for p in txt.split(",") if p.strip()):
-        try:
-            a,b = s.split("-")
-            out.append((float(a), float(b)))
-        except Exception:
-            continue
-    return out
-
-sl_ranges = parse_sl_ranges(sl_ranges_txt)
-
-# ---- Asset dataclass
-@dataclass
-class Asset:
-    name: str
-    cot_name: str
-    symbol: str
-    rvol_lookback: int = 20
-    atr_lookback: int = 14
-
-asset_obj = Asset(name="Gold", cot_name="GOLD - COMMODITY EXCHANGE INC.", symbol=symbol)
-
-# ---- Data fetcher using yahooquery (defensive)
-def fetch_price(symbol: str, start: Optional[str], end: Optional[str], interval: str = "1d") -> pd.DataFrame:
+# fetch price: using yahooquery
+def fetch_price(symbol: str, start: Optional[str] = None, end: Optional[str] = None, interval: str = "1d") -> pd.DataFrame:
     if YahooTicker is None:
-        logger.error("yahooquery not installed. Install via `pip install yahooquery`.")
+        st.error("yahooquery not installed; install `yahooquery` to fetch price data.")
         return pd.DataFrame()
     try:
-        t = YahooTicker(symbol)
-        raw = t.history(start=start, end=end, interval=interval)
-        # yahooquery sometimes returns MultiIndex or dict
+        tq = YahooTicker(symbol)
+        raw = tq.history(start=start, end=end, interval=interval)
+        # yahooquery sometimes returns DataFrame or dict-like
+        if raw is None:
+            return pd.DataFrame()
         if isinstance(raw, dict):
             raw = pd.DataFrame(raw)
-        if raw is None or raw.empty:
-            return pd.DataFrame()
+        # flatten multiindex index if present
         if isinstance(raw.index, pd.MultiIndex):
             raw = raw.reset_index(level=0, drop=True)
         raw.index = pd.to_datetime(raw.index)
         raw = raw.sort_index()
-        # normalize column names
+        # lower-case columns
         raw.columns = [c.lower() for c in raw.columns]
         if "close" not in raw.columns and "adjclose" in raw.columns:
             raw["close"] = raw["adjclose"]
-        return raw[~raw.index.duplicated()]
-    except Exception as e:
-        logger.error("fetch_price failed: %s", e)
+        return raw[~raw.index.duplicated(keep="first")]
+    except Exception as exc:
+        logger.error("fetch_price failed: %s", exc)
         return pd.DataFrame()
 
-# ---- Features
+# Chunk 2/7: features + labeling
+
 def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
     if "volume" not in df.columns:
         return pd.Series(1.0, index=df.index)
-    rolling_avg = df["volume"].rolling(window=lookback, min_periods=1).mean()
-    rvol = (df["volume"] / rolling_avg.replace(0, np.nan)).fillna(1.0)
-    return rvol
+    rolling = df["volume"].rolling(window=lookback, min_periods=1).mean()
+    return (df["volume"] / rolling.replace(0, np.nan)).fillna(1.0)
 
 def calculate_health_gauge(cot_df: pd.DataFrame, daily_bars: pd.DataFrame, threshold: float = 1.5) -> pd.DataFrame:
     if daily_bars is None or daily_bars.empty:
         return pd.DataFrame()
     db = daily_bars.copy()
     db["rvol"] = compute_rvol(db)
-    score = (db["rvol"] >= threshold).astype(float)
-    return pd.DataFrame({"health_gauge": score}, index=db.index)
+    db["health_gauge"] = (db["rvol"] >= threshold).astype(float)
+    return db[["health_gauge"]]
 
-def ensure_no_duplicate_index(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_unique_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return df
     if df.index.duplicated().any():
         df = df[~df.index.duplicated(keep="first")]
     return df.sort_index()
 
-# Chunk 3/7: labeling / generate_candidates_and_labels
+# Labeling: generate candidates & triple-barrier-like labeling
 def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1).fillna(close.iloc[0])
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr
 
-def generate_candidates_and_labels(
-    bars: pd.DataFrame,
-    lookback: int = 64,
-    k_tp: float = 3.0,
-    k_sl: float = 1.0,
-    atr_window: int = 14,
-    max_bars: int = 60,
-    direction: str = "long",
-) -> pd.DataFrame:
-    """
-    Generate candidates with ATR-based SL/TP + triple-barrier-like labeling.
-    Returns DataFrame with candidate_time, entry_price, atr, sl_price, tp_price, end_time, label, duration, realized_return, direction
-    """
+def generate_candidates_and_labels(bars: pd.DataFrame,
+                                   lookback: int = 64,
+                                   k_tp: float = 3.0,
+                                   k_sl: float = 1.0,
+                                   atr_window: int = 14,
+                                   max_bars: int = 60,
+                                   direction: str = "long") -> pd.DataFrame:
     if bars is None or bars.empty:
         return pd.DataFrame()
-
-    df = bars.copy()
-    df.index = pd.to_datetime(df.index)
-    df = ensure_no_duplicate_index(df)
-
-    # ensure required columns
-    for c in ("high", "low", "close"):
-        if c not in df.columns:
-            raise KeyError(f"Missing column {c} in bars")
-
-    df["tr"] = _true_range(df["high"], df["low"], df["close"])
-    df["atr"] = df["tr"].rolling(window=atr_window, min_periods=1).mean().fillna(method="ffill").fillna(0.0)
-
-    records = []
-    n = len(df)
+    bars = bars.copy()
+    bars.index = pd.to_datetime(bars.index)
+    bars = ensure_unique_index(bars)
+    for col in ("high", "low", "close"):
+        if col not in bars.columns:
+            raise KeyError(f"Missing column {col}")
+    bars["tr"] = _true_range(bars["high"], bars["low"], bars["close"])
+    bars["atr"] = bars["tr"].rolling(window=atr_window, min_periods=1).mean()
+    recs = []
+    n = len(bars)
     for i in range(lookback, n):
-        t = df.index[i]
-        entry_price = float(df["close"].iat[i])
-        atr_t = float(df["atr"].iat[i])
-        if atr_t <= 0 or math.isnan(atr_t):
+        t = bars.index[i]
+        entry_px = float(bars["close"].iat[i])
+        atr = float(bars["atr"].iat[i])
+        if atr <= 0 or math.isnan(atr):
             continue
-
-        if direction == "long":
-            sl_price = entry_price - k_sl * atr_t
-            tp_price = entry_price + k_tp * atr_t
-        else:
-            sl_price = entry_price + k_sl * atr_t
-            tp_price = entry_price - k_tp * atr_t
-
+        sl_px = entry_px - k_sl * atr if direction == "long" else entry_px + k_sl * atr
+        tp_px = entry_px + k_tp * atr if direction == "long' else entry_px - k_tp * atr" if False else entry_px + k_tp * atr
+        # (the above is to avoid weird formatting; we always use long logic here — pipeline assumed long)
         end_idx = min(i + max_bars, n - 1)
         label = 0
         hit_idx = end_idx
-        hit_price = float(df["close"].iat[end_idx])
-
+        hit_px = float(bars["close"].iat[end_idx])
         for j in range(i + 1, end_idx + 1):
-            px_high = float(df["high"].iat[j])
-            px_low = float(df["low"].iat[j])
-            if direction == "long":
-                if px_high >= tp_price:
-                    label, hit_idx, hit_price = 1, j, tp_price
-                    break
-                if px_low <= sl_price:
-                    label, hit_idx, hit_price = 0, j, sl_price
-                    break
-            else:
-                if px_low <= tp_price:
-                    label, hit_idx, hit_price = 1, j, tp_price
-                    break
-                if px_high >= sl_price:
-                    label, hit_idx, hit_price = 0, j, sl_price
-                    break
-
-        end_time = df.index[hit_idx]
-        realized_return = (hit_price - entry_price) / entry_price if direction == "long" else (entry_price - hit_price) / entry_price
-        dur_min = (end_time - t).total_seconds() / 60.0
-
-        rec = {
+            hi = float(bars["high"].iat[j]); lo = float(bars["low"].iat[j])
+            if hi >= tp_px:
+                label, hit_idx, hit_px = 1, j, tp_px
+                break
+            if lo <= sl_px:
+                label, hit_idx, hit_px = 0, j, sl_px
+                break
+        end_t = bars.index[hit_idx]
+        realized_return = (hit_px - entry_px) / entry_px
+        dur_min = (end_t - t).total_seconds() / 60.0
+        recs.append({
             "candidate_time": t,
-            "entry_price": entry_price,
-            "atr": atr_t,
-            "sl_price": sl_price,
-            "tp_price": tp_price,
-            "end_time": end_time,
+            "entry_price": float(entry_px),
+            "atr": float(atr),
+            "sl_price": float(sl_px),
+            "tp_price": float(tp_px),
+            "end_time": end_t,
             "label": int(label),
             "duration": float(dur_min),
             "realized_return": float(realized_return),
-            "direction": direction
-        }
-        records.append(rec)
-    return pd.DataFrame(records)
+            "direction": "long"
+        })
+    return pd.DataFrame(recs)
 
+# Chunk 3/7: backtest + summarization
 
-# Chunk 4/7: simulate_limits, breadth backtest, sweep
-def simulate_limits(
-    df: pd.DataFrame,
-    bars: pd.DataFrame,
-    label_col: str = "pred_label",
-    symbol: str = "GC=F",
-    sl: float = 0.01,
-    tp: float = 0.02,
-    max_holding: int = 20
-) -> pd.DataFrame:
+def simulate_limits(df: pd.DataFrame,
+                    bars: pd.DataFrame,
+                    label_col: str = "pred_label",
+                    symbol: str = "GC=F",
+                    sl: float = 0.02,
+                    tp: float = 0.04,
+                    max_holding: int = 60) -> pd.DataFrame:
     if df is None or df.empty or bars is None or bars.empty:
         return pd.DataFrame()
     trades = []
+    bars = bars.copy()
+    bars.index = pd.to_datetime(bars.index)
     for _, row in df.iterrows():
         lbl = row.get(label_col, 0)
         if lbl == 0 or pd.isna(lbl):
             continue
-        entry_time = pd.to_datetime(row.get("candidate_time", row.name))
-        if entry_time not in bars.index:
+        entry_t = pd.to_datetime(row.get("candidate_time", row.name))
+        if entry_t not in bars.index:
             continue
-        entry_price = float(bars.loc[entry_time, "close"])
+        entry_px = float(bars.loc[entry_t, "close"])
         direction = 1 if lbl > 0 else -1
-        sl_price = entry_price * (1 - sl) if direction > 0 else entry_price * (1 + sl)
-        tp_price = entry_price * (1 + tp) if direction > 0 else entry_price * (1 - tp)
-
-        exit_time = None; exit_price = None; pnl = None
-        window = bars.loc[entry_time:].head(max_holding)
-        if window.empty:
+        sl_px = entry_px * (1 - sl) if direction > 0 else entry_px * (1 + sl)
+        tp_px = entry_px * (1 + tp) if direction > 0 else entry_px * (1 - tp)
+        exit_t, exit_px, pnl = None, None, None
+        segment = bars.loc[entry_t:].head(max_holding)
+        if segment.empty:
             continue
-        for t, b in window.iterrows():
+        for t, b in segment.iterrows():
             lo, hi = float(b["low"]), float(b["high"])
             if direction > 0:
-                if lo <= sl_price:
-                    exit_time, exit_price, pnl = t, sl_price, -sl
+                if lo <= sl_px:
+                    exit_t, exit_px, pnl = t, sl_px, -sl
                     break
-                if hi >= tp_price:
-                    exit_time, exit_price, pnl = t, tp_price, tp
+                if hi >= tp_px:
+                    exit_t, exit_px, pnl = t, tp_px, tp
                     break
             else:
-                if hi >= sl_price:
-                    exit_time, exit_price, pnl = t, sl_price, -sl
+                if hi >= sl_px:
+                    exit_t, exit_px, pnl = t, sl_px, -sl
                     break
-                if lo <= tp_price:
-                    exit_time, exit_price, pnl = t, tp_price, tp
+                if lo <= tp_px:
+                    exit_t, exit_px, pnl = t, tp_px, tp
                     break
-        if exit_time is None:
-            last = window.iloc[-1]
-            exit_time = last.name
-            exit_price = float(last["close"])
-            pnl = (exit_price - entry_price) / entry_price * direction
+        if exit_t is None:
+            last_bar = segment.iloc[-1]
+            exit_t = last_bar.name
+            exit_px = float(last_bar["close"])
+            pnl = (exit_px - entry_px) / entry_px * direction
         trades.append({
             "symbol": symbol,
-            "entry_time": entry_time,
-            "entry_price": entry_price,
+            "entry_time": entry_t,
+            "entry_price": entry_px,
             "direction": direction,
-            "exit_time": exit_time,
-            "exit_price": exit_price,
+            "exit_time": exit_t,
+            "exit_price": exit_px,
             "pnl": float(pnl)
         })
     return pd.DataFrame(trades)
 
-def run_breadth_backtest(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = "GC=F"):
-    """
-    For each breadth mode (low/mid/high), apply thresholds and run simulate_limits.
-    Return dict with summary (per-mode aggregated DataFrame) and detailed overlays.
-    """
-    results = {"summary": [], "detailed_trades": {}, "diagnostics": []}
-    if clean is None or clean.empty:
-        results["diagnostics"].append("No clean candidates provided.")
-        return results
+def summarize_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    total_trades = len(trades)
+    win_rate = float((trades["pnl"] > 0).mean())
+    avg_pnl = float(trades["pnl"].mean())
+    median_pnl = float(trades["pnl"].median())
+    total_pnl = float(trades["pnl"].sum())
+    max_dd = float(trades["pnl"].cumsum().min())
+    start_time = trades["entry_time"].min()
+    end_time = trades["exit_time"].max()
+    return pd.DataFrame([{
+        "total_trades": total_trades,
+        "win_rate": win_rate,
+        "avg_pnl": avg_pnl,
+        "median_pnl": median_pnl,
+        "total_pnl": total_pnl,
+        "max_drawdown": max_dd,
+        "start_time": start_time,
+        "end_time": end_time
+    }])
 
-    modes = {
-        "low": {"sell_th": 4.5, "buy_th": 5.5},
-        "mid": {"sell_th": 4, "buy_th": 6},
-        "high": {"sell_th": 3.5, "buy_th":6.5}
-    }
-    for mode, th in modes.items():
-        try:
-            df = clean.copy()
-            # ensure 'signal' exists (scale pred_prob 0-1 → 0-10)
-            if "signal" not in df.columns:
-                if "pred_prob" in df.columns:
-                    df["signal"] = (df["pred_prob"] * 10).round().astype(int)
-                else:
-                    df["signal"] = 0
-            df["pred_label"] = 0
-            df.loc[df["signal"] > th["buy_th"], "pred_label"] = 1
-            df.loc[df["signal"] < th["sell_th"], "pred_label"] = -1
+def combine_summaries(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows = []
+    for mode, trades_df in results.items():
+        if trades_df is None or trades_df.empty:
+            continue
+        s = summarize_trades(trades_df)
+        if not s.empty:
+            s["mode"] = mode
+            rows.append(s)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
 
-            overlay = simulate_limits(df, bars, label_col="pred_label", symbol=symbol, max_holding=max_bars)
-            trades_df = overlay
-            summary = {
-                "mode": mode,
-                "total_trades": int(trades_df.shape[0]),
-                "win_rate": float((trades_df["pnl"] > 0).mean()) if not trades_df.empty else 0.0,
-                "total_pnl": float(trades_df["pnl"].sum()) if not trades_df.empty else 0.0
-            }
-            results["summary"].append(summary)
-            results["detailed_trades"][mode] = trades_df
-        except Exception as e:
-            results["diagnostics"].append(f"{mode} failed: {e}")
-            results["detailed_trades"][mode] = pd.DataFrame()
-    return results
+# Chunk 4/7: model training (xgboost), prediction and export helpers
 
-def run_sweep(clean: pd.DataFrame, bars: pd.DataFrame, symbol: str = "GC=F"):
-    """
-    Sweep combinations of sell/buy thresholds (example grid).
-    Return dict keyed by sweep id with overlay DataFrames.
-    """
-    results = {}
-    if clean is None or clean.empty:
-        return results
-    sell_ths = [3,4,5]
-    buy_ths = [5,6,7]
-    for s in sell_ths:
-        for b in buy_ths:
-            key = f"sell{s}_buy{b}"
-            try:
-                df = clean.copy()
-                if "signal" not in df.columns:
-                    df["signal"] = (df.get("pred_prob", 0.0) * 10).round().astype(int)
-                df["pred_label"] = 0
-                df.loc[df["signal"] > b, "pred_label"] = 1
-                df.loc[df["signal"] < s, "pred_label"] = -1
-                overlay = simulate_limits(df, bars, label_col="pred_label", symbol=symbol, max_holding=max_bars)
-                results[key] = {"trades": overlay.shape[0], "overlay": overlay}
-            except Exception as e:
-                results[key] = {"error": str(e)}
-    return results
-
-# Chunk 5/7: XGBoost wrapper, training, prediction, model export
-class XGBWrapper:
+class BoosterWrapper:
     def __init__(self, booster, feature_names: List[str]):
         self.booster = booster
         self.feature_names = feature_names
@@ -408,19 +333,19 @@ class XGBWrapper:
     def predict_proba(self, X: pd.DataFrame) -> pd.Series:
         d = self._dmatrix(X)
         if self.best_iteration is not None:
-            raw = self.booster.predict(d, iteration_range=(0, int(self.best_iteration)+1))
+            raw = self.booster.predict(d, iteration_range=(0, int(self.best_iteration) + 1))
         else:
             raw = self.booster.predict(d)
-        raw = np.asarray(raw, dtype=float)
+        raw = np.clip(raw, 0.0, 1.0)
         return pd.Series(raw, index=X.index, name="confirm_proba")
 
     def save_model(self, path: str):
         self.booster.save_model(path)
 
-    def feature_importance(self, importance_type: str = "gain") -> pd.DataFrame:
-        imp = self.booster.get_score(importance_type=importance_type) or {}
-        df = pd.DataFrame([(k, float(imp.get(k, 0.0))) for k in self.feature_names], columns=["feature", "importance"])
-        return df.sort_values("importance", ascending=False).reset_index(drop=True)
+    def feature_importance(self) -> pd.DataFrame:
+        imp = self.booster.get_score(importance_type="gain")
+        return (pd.DataFrame([(f, imp.get(f, 0.0)) for f in self.feature_names], columns=["feature", "gain"])
+                .sort_values("gain", ascending=False).reset_index(drop=True))
 
 def train_xgb_confirm(clean: pd.DataFrame,
                       feature_cols: List[str],
@@ -428,20 +353,18 @@ def train_xgb_confirm(clean: pd.DataFrame,
                       num_boost_round: int = 200,
                       early_stopping_rounds: int = 20,
                       test_size: float = 0.2,
-                      random_state: int = 42) -> Tuple[XGBWrapper, Dict[str,Any]]:
+                      random_state: int = 42) -> Tuple[BoosterWrapper, Dict[str, Any]]:
     if xgb is None:
         raise RuntimeError("xgboost not installed")
     X = clean[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     y = pd.to_numeric(clean[label_col], errors="coerce")
-    mask = X.replace([np.inf, -np.inf], np.nan).notnull().all(axis=1) & y.notnull()
-    X, y = X.loc[mask], y.loc[mask]
-    if X.empty:
-        raise ValueError("No valid training rows")
-
+    mask = X.replace([np.inf, -np.inf], np.nan).notnull().all(1) & y.notnull()
+    X, y = X[mask], y[mask]
+    if len(X) < 10 or y.nunique() < 2:
+        raise ValueError("Not enough data or not both classes present for training")
     Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=test_size, stratify=y, random_state=random_state)
-    dtr = xgb.DMatrix(Xtr, label=ytr, feature_names=feature_cols)
-    dva = xgb.DMatrix(Xva, label=yva, feature_names=feature_cols)
-
+    dtr = xgb.DMatrix(Xtr, label=ytr)
+    dva = xgb.DMatrix(Xva, label=yva)
     params = {
         "objective": "binary:logistic",
         "eta": 0.05,
@@ -450,79 +373,152 @@ def train_xgb_confirm(clean: pd.DataFrame,
         "colsample_bytree": 0.8,
         "eval_metric": "logloss",
         "verbosity": 0,
-        "scale_pos_weight": float((y==0).sum()) / max(1.0, float((y==1).sum()))
+        "scale_pos_weight": float((y == 0).sum()) / max(1, (y == 1).sum())
     }
-
-    bst = xgb.train(params, dtr,
-                    num_boost_round=int(num_boost_round),
-                    evals=[(dva, "validation")],
-                    early_stopping_rounds=int(early_stopping_rounds) if early_stopping_rounds else None,
-                    verbose_eval=False)
-
-    wrap = XGBWrapper(bst, feature_cols)
-    y_proba_val = wrap.predict_proba(Xva)
-    y_pred_val = (y_proba_val >= 0.5).astype(int)
+    bst = xgb.train(params, dtr, num_boost_round, evals=[(dva, "val")],
+                    early_stopping_rounds=early_stopping_rounds, verbose_eval=False)
+    wrap = BoosterWrapper(bst, feature_cols)
+    y_proba = wrap.predict_proba(Xva)
+    y_pred = (y_proba >= 0.5).astype(int)
     metrics = {
-        "n_train": int(len(Xtr)),
-        "n_val": int(len(Xva)),
-        "accuracy": float(accuracy_score(yva, y_pred_val)),
-        "f1": float(f1_score(yva, y_pred_val, zero_division=0)),
-        "val_proba_mean": float(np.nanmean(y_proba_val)) if len(y_proba_val) else 0.0
+        "n_train": int(len(Xtr)), "n_val": int(len(Xva)),
+        "accuracy": float(accuracy_score(yva, y_pred)),
+        "f1": float(f1_score(yva, y_pred, zero_division=0)),
+        "roc_auc": float(roc_auc_score(yva, y_proba))
     }
-    try:
-        metrics["roc_auc"] = float(roc_auc_score(yva, y_proba_val))
-    except Exception:
-        metrics["roc_auc"] = None
-
     return wrap, metrics
 
-def predict_confirm_prob(model: XGBWrapper, candidates: pd.DataFrame, feature_cols: List[str]) -> pd.Series:
-    missing = [c for c in feature_cols if c not in candidates.columns]
+def predict_confirm_prob(model: BoosterWrapper, df: pd.DataFrame, feature_cols: List[str]) -> pd.Series:
+    missing = [c for c in feature_cols if c not in df.columns]
     for m in missing:
-        candidates[m] = 0.0
-    return model.predict_proba(candidates[feature_cols])
+        df[m] = 0.0
+    return model.predict_proba(df[feature_cols])
 
-def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: Dict[str,Any], model_basename: str = "confirm_model", save_fi: bool = True) -> Dict[str,str]:
-    """
-    Save xgboost model (native .model), metadata JSON and feature-importance JSON (optional).
-    Returns dict of saved paths.
-    """
+def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: Dict[str,Any], model_basename: str, save_fi: bool = True):
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    base = f"{model_basename}_{ts}"
     paths = {}
     try:
-        # try xgb booster
-        booster = getattr(model_wrapper, "booster", None) or getattr(model_wrapper, "booster", None)
-        if booster is None and hasattr(model_wrapper, "booster"):
-            booster = model_wrapper.booster
-        if booster is not None and hasattr(booster, "save_model"):
-            model_file = f"{base}.model"
-            booster.save_model(model_file)
+        if hasattr(model_wrapper, "booster"):
+            model_file = f"{model_basename}_{ts}.model"
+            model_wrapper.save_model(model_file)
             paths["model"] = model_file
         else:
             # fallback: joblib
-            joblib_file = f"{base}.joblib"
-            joblib.dump(model_wrapper, joblib_file)
-            paths["joblib"] = joblib_file
-
-        meta_file = f"{base}.json"
+            p = f"{model_basename}_{ts}.joblib"
+            joblib.dump({"model": model_wrapper, "features": feature_list, "metrics": metrics}, p)
+            paths["model"] = p
+        meta_file = f"{model_basename}_{ts}.json"
         with open(meta_file, "w") as f:
-            json.dump({"features": feature_list, "metrics": metrics, "saved_at": ts}, f, indent=2, default=str)
+            json.dump({"features": feature_list, "metrics": metrics, "saved_at": ts}, f, default=str, indent=2)
         paths["meta"] = meta_file
-
         if save_fi and hasattr(model_wrapper, "feature_importance"):
             try:
                 fi_df = model_wrapper.feature_importance()
-                fi_file = f"{base}_feature_importance.json"
-                fi_df.to_json(fi_file, orient="records", date_format="iso")
-                paths["feature_importance"] = fi_file
+                fi_path = f"{model_basename}_{ts}_fi.csv"
+                fi_df.to_csv(fi_path, index=False)
+                paths["feature_importance"] = fi_path
             except Exception:
                 pass
-    except Exception as e:
-        logger.exception("export_model_and_metadata failed: %s", e)
+    except Exception as exc:
+        logger.exception("Failed to export model: %s", exc)
     return paths
 
-# Chunk 6/7: Supabase logger + (optional) PyTorch multi-model bundler
+# Chunk 5/7: breadth_backtest (multi-level) + sweep/grid search
+
+def run_breadth_backtest(clean: pd.DataFrame,
+                         bars: pd.DataFrame,
+                         levels_config: Dict[str, Dict[str, Any]],
+                         feature_cols: List[str],
+                         model_train_kwargs: Dict[str,Any]) -> Dict[str, Any]:
+    """
+    For each level in levels_config (keys: 'L1','L2','L3'), optionally retrain a confirm model on filtered candidates,
+    then produce trades using the level thresholds and RR/SL settings.
+    Returns standardized dict: { "summary": combined_df, "detailed_trades": {level: trades_df}, "diagnostics": [] }
+    levels_config: { 'L1': {'buy_th':..., 'sell_th':..., 'rr_min':..., 'rr_max':..., 'sl_min':..., 'sl_max':...}, ... }
+    """
+    out = {"summary": [], "detailed_trades": {}, "diagnostics": []}
+    if clean is None or clean.empty:
+        out["diagnostics"].append("No candidate set provided.")
+        return out
+    for lvl_name, cfg in levels_config.items():
+        try:
+            buy_th = cfg.get("buy_th")
+            sell_th = cfg.get("sell_th")
+            rr_min = cfg.get("rr_min")
+            rr_max = cfg.get("rr_max")
+            sl_min = cfg.get("sl_min")
+            sl_max = cfg.get("sl_max")
+
+            # Build a signal column on clean (use existing 'signal' if present; else scale pred_prob)
+            df = clean.copy()
+            if "signal" not in df.columns:
+                # scale pred_prob to 0-10 (approx) if available
+                if "pred_prob" in df.columns:
+                    df["signal"] = (df["pred_prob"] * 10).round().astype(int)
+                else:
+                    df["signal"] = 0
+
+            # Set predicted labels based on level thresholds
+            df["pred_label"] = 0
+            df.loc[df["signal"] > buy_th, "pred_label"] = 1
+            df.loc[df["signal"] < sell_th, "pred_label"] = -1
+
+            # For this implementation we won't retrain a new model per level unless user requests — keep simple:
+            # Simulate using a representative SL/TP from the level config (choose mean)
+            # Choose sl_pct as mean of sl_min/sl_max and choose tp from rr_min * sl_pct
+            sl_pct = float((sl_min + sl_max) / 2.0)
+            rr = float((rr_min + rr_max) / 2.0)
+            tp_pct = rr * sl_pct
+
+            trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
+            out["detailed_trades"][lvl_name] = trades
+            summary = summarize_trades(trades)
+            if not summary.empty:
+                summary["mode"] = lvl_name
+                out["summary"].append(summary.iloc[0].to_dict())
+            out["diagnostics"].append(f"{lvl_name}: simulated {len(trades)} trades, sl={sl_pct:.4f}, tp={tp_pct:.4f}")
+        except Exception as exc:
+            logger.exception("Breadth level %s failed: %s", lvl_name, exc)
+            out["diagnostics"].append(f"{lvl_name} error: {exc}")
+    out["summary"] = out["summary"] or []
+    return out
+
+def run_grid_sweep(clean: pd.DataFrame,
+                   bars: pd.DataFrame,
+                   rr_vals: List[float],
+                   sl_ranges: List[Tuple[float,float]],
+                   mpt_list: List[float],
+                   feature_cols: List[str],
+                   model_train_kwargs: Dict[str,Any]) -> Dict[str, Any]:
+    """
+    Sweep RR x SL ranges x model probability thresholds (mpt_list).
+    Returns dict keyed by config string with overlay and summary.
+    """
+    results = {}
+    if clean is None or clean.empty:
+        return results
+    for rr in rr_vals:
+        for sl_min, sl_max in sl_ranges:
+            sl_pct = (sl_min + sl_max) / 2.0
+            tp_pct = rr * sl_pct
+            for mpt in mpt_list:
+                key = f"rr{rr:.2f}_sl{sl_min:.3f}-{sl_max:.3f}_mpt{mpt:.2f}"
+                try:
+                    df = clean.copy()
+                    if "pred_prob" not in df.columns:
+                        # if only 'signal' exists, convert signal -> prob-like
+                        if "signal" in df.columns:
+                            df["pred_prob"] = (df["signal"] / 10.0).clip(0.0, 1.0)
+                        else:
+                            df["pred_prob"] = 0.0
+                    df["pred_label"] = (df["pred_prob"] >= mpt).astype(int)
+                    trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
+                    results[key] = {"trades_count": len(trades), "overlay": trades}
+                except Exception as exc:
+                    logger.exception("Sweep config %s failed: %s", key, exc)
+                    results[key] = {"error": str(exc)}
+    return results
+# Chunk 6/7: supabase logger (light wrapper), helpers, save & pick top3
 
 class SupabaseLogger:
     def __init__(self):
@@ -538,300 +534,249 @@ class SupabaseLogger:
 
     def log_run(self, metrics: Dict, metadata: Dict, trades: Optional[List[Dict]] = None) -> str:
         run_id = metadata.get("run_id") or str(uuid.uuid4())
-        rec = {**metadata, "metrics": metrics, "run_id": run_id}
-        resp = self.client.table(self.runs_tbl).insert(rec).execute()
+        metadata["run_id"] = run_id
+        payload = {**metadata, "metrics": metrics}
+        resp = self.client.table(self.runs_tbl).insert(payload).execute()
         if getattr(resp, "error", None):
-            raise RuntimeError(f"Supabase insert run error: {resp.error}")
+            raise RuntimeError(f"Failed to insert run: {resp.error}")
         if trades:
             for t in trades:
                 t["run_id"] = run_id
             tr_resp = self.client.table(self.trades_tbl).insert(trades).execute()
             if getattr(tr_resp, "error", None):
-                raise RuntimeError(f"Supabase insert trades error: {tr_resp.error}")
+                raise RuntimeError(f"Failed to insert trades: {tr_resp.error}")
         return run_id
 
-# Optional PyTorch multi-model training & bundling (top-3)
-def train_and_bundle_top3(train_loader, val_loader, input_dim: int, save_dir: str = "saved_models", epochs: int = 10, device: Optional[str] = None):
+    def fetch_runs(self, symbol: Optional[str] = None, limit: int = 50):
+        q = self.client.table(self.runs_tbl)
+        if symbol:
+            q = q.eq("symbol", symbol)
+        resp = q.order("start_date", desc=True).limit(limit).execute()
+        if getattr(resp, "error", None):
+            raise RuntimeError(f"Failed to fetch runs: {resp.error}")
+        return getattr(resp, "data", [])
+
+    def fetch_trades(self, run_id: str):
+        resp = self.client.table(self.trades_tbl).select("*").eq("run_id", run_id).execute()
+        if getattr(resp, "error", None):
+            raise RuntimeError(f"Failed to fetch trades: {resp.error}")
+        return getattr(resp, "data", [])
+
+# Helpers
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode()
+
+def pick_top_runs_by_metrics(runs: List[Dict], top_n: int = 3):
     """
-    Train a small set of PyTorch candidate models and bundle the top-3 by val accuracy into a .pt file.
-    Returns list of dicts: [{"name":..., "model":..., "history":...}, ...] for top3
+    Ranks runs using weightings:
+      1) total_pnl (primary importance)
+      2) win_rate (secondary)
+    runs: list of supabase 'metrics' dictionaries or run rows with metrics
+    Returns top_n items
     """
-    if torch is None:
-        raise RuntimeError("PyTorch not available")
+    scored = []
+    for r in runs:
+        metrics = r.get("metrics") if isinstance(r, dict) else r
+        total_pnl = metrics.get("total_pnl", 0.0) if metrics else 0.0
+        win_rate = metrics.get("win_rate", 0.0) if metrics else 0.0
+        # Composite score: rank primarily by total_pnl, tie-break by win_rate.
+        score = float(total_pnl) + float(win_rate) * 0.01  # small boost from win_rate
+        scored.append((score, r))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:top_n]]
+# Chunk 7/7: main pipeline + UI actions + breadth/sweep handlers
 
-    save_path = Path(save_dir); save_path.mkdir(parents=True, exist_ok=True)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-    # candidate architectures
-    class SimpleMLP(nn.Module):
-        def __init__(self, input_dim, hidden=64):
-            super().__init__()
-            self.net = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(0.3), nn.Linear(hidden, 2))
-        def forward(self, x): return self.net(x)
-
-    class SimpleLSTM(nn.Module):
-        def __init__(self, input_dim, hidden=32):
-            super().__init__()
-            self.lstm = nn.LSTM(input_dim, hidden, batch_first=True)
-            self.fc = nn.Linear(hidden, 2)
-        def forward(self, x):
-            out, (hn, _) = self.lstm(x)
-            return self.fc(hn[-1])
-
-    candidates = {
-        "mlp": SimpleMLP(input_dim),
-    }
-    results = []
-    for name, model in candidates.items():
-        model = model.to(device)
-        optimizer = optim.Adam(model.parameters(), lr=1e-3)
-        criterion = nn.CrossEntropyLoss()
-        history = {"train_loss": [], "val_acc": []}
-        for epoch in range(epochs):
-            model.train()
-            total_loss = 0.0
-            for xb, yb in train_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                optimizer.zero_grad()
-                preds = model(xb)
-                loss = criterion(preds, yb)
-                loss.backward(); optimizer.step()
-                total_loss += loss.item()
-            avg_loss = total_loss / max(1, len(train_loader))
-            # val
-            model.eval()
-            correct = 0; total = 0
-            with torch.no_grad():
-                for xb, yb in val_loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    preds = model(xb)
-                    correct += (preds.argmax(dim=1) == yb).sum().item()
-                    total += yb.size(0)
-            val_acc = correct / max(1, total)
-            history["train_loss"].append(avg_loss); history["val_acc"].append(val_acc)
-        results.append({"name": name, "model": model.cpu(), "history": history})
-
-    # rank by val_acc
-    results.sort(key=lambda r: max(r["history"]["val_acc"]) if r["history"]["val_acc"] else 0.0, reverse=True)
-    top3 = results[:3]
-    # bundle state_dicts
-    bundle = {r["name"]: r["model"].state_dict() for r in top3}
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    bundle_path = save_path / f"top3_bundle_{ts}.pt"
-    torch.save(bundle, str(bundle_path))
-    logger.info("Saved top3 bundle: %s", bundle_path)
-    return top3, str(bundle_path)
-
-# Chunk 7/7: main pipeline, UI wiring, save/logging handlers
+# small placeholders / defaults
+feat_cols_default = ["atr", "rvol", "duration", "hg"]
 
 def run_main_pipeline():
-    st.info(f"Fetching price for {symbol}…")
+    st.info(f"Fetching price for {symbol} …")
     bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
     if bars is None or bars.empty:
-        st.error("No price data; check symbol and date range.")
+        st.error("No price data returned.")
         return
 
-    bars = ensure_no_duplicate_index(bars)
-    # daily bars for health gauge
+    bars = ensure_unique_index(bars)
+    # daily for health
     try:
         daily = bars.resample("1D").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
     except Exception:
-        daily = pd.DataFrame()
+        daily = bars.copy().resample("1D").agg({"close":"last","volume":"sum"})
+    health = calculate_health_gauge(None, daily)
+    latest_health = float(health["health_gauge"].iloc[-1]) if not health.empty else 0.0
+    st.metric("Latest HealthGauge", f"{latest_health:.3f}")
 
-    health_df = calculate_health_gauge(None, daily, threshold=1.5) if not daily.empty else pd.DataFrame()
-    if not health_df.empty:
-        latest_health = float(health_df["health_gauge"].iloc[-1])
-    else:
-        latest_health = 0.0
-    st.metric("Latest HealthGauge", f"{latest_health:.4f}")
-
-    if not (latest_health >= buy_threshold or latest_health <= sell_threshold or force_run):
-        st.warning("HealthGauge gating prevented main run. Use Force Run to override.")
+    if not (latest_health >= buy_threshold_global or latest_health <= sell_threshold_global or force_run):
+        st.warning("Health gating prevented run. Use 'Force run' to override.")
         return
 
-    # compute rvol and attach to bars
-    bars["rvol"] = compute_rvol(bars, lookback=asset_obj.rvol_lookback)
-
-    # generate candidates (labeling)
-    st.info("Generating candidates and labels…")
-    cands = generate_candidates_and_labels(bars, lookback=64, k_tp=2.0, k_sl=1.0, atr_window=asset_obj.atr_lookback, max_bars=max_bars, direction="long")
+    # compute rvol and candidates
+    bars["rvol"] = compute_rvol(bars, lookback=20)
+    cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
     if cands is None or cands.empty:
         st.error("No candidates generated.")
         return
 
-    # attach health gauge as feature if requested
-    if include_health_as_feature and not health_df.empty:
-        # map daily health gauge to candidate_date (normalize)
-        cand_dates = cands["candidate_time"].dt.normalize()
-        hg_series = health_df["health_gauge"].reindex(pd.to_datetime(health_df.index).normalize()).ffill().fillna(0.0)
-        hg_map = hg_series.to_dict()
-        cands["health_gauge"] = cand_dates.map(lambda d: hg_map.get(pd.to_datetime(d), 0.0))
+    # add health-gauge to candidates
+    if not health.empty:
+        hg_map = health["health_gauge"].reindex(pd.to_datetime(health.index)).fillna(method="ffill").to_dict()
+        cands["hg"] = cands["candidate_time"].dt.normalize().map(lambda t: hg_map.get(pd.Timestamp(t).normalize(), 0.0))
     else:
-        cands["health_gauge"] = 0.0
+        cands["hg"] = 0.0
 
-    # prepare clean dataset for training
-    feat_cols = ["atr", "rvol", "duration"]
-    if include_health_as_feature:
-        feat_cols.append("health_gauge")
+    feat_cols = feat_cols_default.copy()
+    if "hg" not in feat_cols:
+        feat_cols.append("hg")
 
-    # the generated candidates include atr/duration/realized_return etc — ensure columns
-    for fc in feat_cols:
-        if fc not in cands.columns:
-            cands[fc] = 0.0
-
-    clean = cands.dropna(subset=["label"]).reset_index(drop=True)
-    if clean.empty:
-        st.error("No labeled candidates available for training.")
-        return
-
-    # train XGBoost confirm
-    st.info("Training XGBoost confirm model…")
+    # training confirm-stage (one model for pipeline)
+    st.info("Training confirm-stage XGBoost model…")
     try:
-        model_wrap, metrics = train_xgb_confirm(clean, feat_cols, label_col="label", num_boost_round=num_boost, early_stopping_rounds=early_stop, test_size=test_size)
-    except Exception as e:
-        logger.exception("Training failed: %s", e)
-        st.error(f"Training failed: {e}")
+        model_wrap, metrics = train_xgb_confirm(cands, feat_cols, label_col="label",
+                                                num_boost_round=num_boost,
+                                                early_stopping_rounds=early_stop,
+                                                test_size=test_size)
+    except Exception as exc:
+        logger.exception("Training failed: %s", exc)
+        st.error(f"Training failed: {exc}")
         return
 
     st.write("Training metrics:", metrics)
 
-    # predictions
-    try:
-        clean["pred_prob"] = predict_confirm_prob(model_wrap, clean, feat_cols).reindex(clean.index).fillna(0.0)
-        clean["pred_label"] = (clean["pred_prob"] >= p_fast).astype(int)
-    except Exception as e:
-        logger.exception("Prediction failed: %s", e)
-        st.error(f"Prediction failed: {e}")
-        return
+    # predict and simulate
+    cands["pred_prob"] = predict_confirm_prob(model_wrap, cands, feat_cols)
+    cands["pred_label"] = (cands["pred_prob"] >= p_fast).astype(int)
 
-    # simulate fills/backtest
-    st.info("Simulating fills & backtest…")
-    trades = simulate_limits(clean, bars, label_col="pred_label", max_holding=max_bars)
-    st.write("Simulated trades:", 0 if trades is None else len(trades))
-    if trades is None or trades.empty:
-        st.warning("No trades simulated.")
-    else:
-        # show basic metrics
-        trades["pnl"] = trades["pnl"].astype(float)
-        num_trades = len(trades)
-        total_pnl = trades["pnl"].sum()
-        win_rate = float((trades["pnl"] > 0).mean())
-        st.metric("Num trades (sim)", f"{num_trades}")
-        st.metric("Total PnL (sim)", f"{total_pnl:.6f}")
-        st.metric("Win rate", f"{win_rate:.2%}")
+    st.info("Simulating trades using predicted labels…")
+    trades = simulate_limits(cands, bars, label_col="pred_label", max_holding=60)
+    st.write("Simulated trades:", len(trades))
+    if not trades.empty:
+        st.dataframe(trades.head())
+        s = summarize_trades(trades)
+        st.dataframe(s)
 
-        if overlay_entries_on_price:
-            fig, ax = plt.subplots(figsize=(12,4))
-            if "close" in bars.columns:
-                bars["close"].plot(ax=ax, label="close")
-            for _, r in trades.iterrows():
-                t = r["entry_time"]
-                color = "g" if r["pnl"] > 0 else "r"
-                ax.axvline(x=t, color=color, alpha=0.6, linewidth=0.8)
-            ax.set_title(f"{symbol} — Price with entry overlays")
-            ax.legend()
-            st.pyplot(fig)
-
-    # save final model (retrain on full candidate universe) and export
-    st.subheader("Save Model (train on full candidate universe)")
-    model_name_input = st.text_input("Enter model name", value=f"confirm_model_{symbol.replace('=','_')}")
-    if st.button("Save model as .model + metadata"):
-        try:
-            # retrain on full candidate universe (no gating)
-            full_cands = generate_candidates_and_labels(bars, lookback=64, k_tp=2.0, k_sl=1.0, atr_window=asset_obj.atr_lookback, max_bars=max_bars, direction="long")
-            if include_health_as_feature and not health_df.empty:
-                cand_dates = full_cands["candidate_time"].dt.normalize()
-                hg_series = health_df["health_gauge"].reindex(pd.to_datetime(health_df.index).normalize()).ffill().fillna(0.0)
-                hg_map = hg_series.to_dict()
-                full_cands["health_gauge"] = cand_dates.map(lambda d: hg_map.get(pd.to_datetime(d), 0.0))
-            for col in feat_cols + ["label"]:
-                if col not in full_cands.columns:
-                    full_cands[col] = np.nan
-            for col in feat_cols:
-                full_cands[col] = pd.to_numeric(full_cands[col], errors="coerce").fillna(0.0)
-            full_clean = full_cands.dropna(subset=["label"])
-            full_clean = full_clean[full_clean["label"].isin([0,1])]
-            if full_clean.empty:
-                st.error("No valid labeled data in full candidate set.")
-            else:
-                final_model, final_metrics = train_xgb_confirm(full_clean, feat_cols, label_col="label", num_boost_round=num_boost, early_stopping_rounds=early_stop, test_size=test_size)
-                saved_paths = export_model_and_metadata(final_model.booster if hasattr(final_model, "booster") else final_model, feat_cols, final_metrics, model_basename=model_name_input, save_fi=save_feature_importance)
-                st.success(f"Saved final model. Files: {saved_paths}")
-        except Exception as e:
-            logger.exception("Saving final model failed: %s", e)
-            st.error(f"Failed to train/save final model: {e}")
-
-    # Supabase logging
-    st.subheader("Logging")
-    if st.button("Save logs to Supabase"):
+    # ---------------------------
+    # Auto-log to Supabase (if configured) and then save model
+    # ---------------------------
+    if create_client is not None and st.button("Log run to Supabase and save model"):
         try:
             supa = SupabaseLogger()
             run_id = str(uuid.uuid4())
             metadata = {
-                "run_id": run_id,
-                "symbol": symbol,
-                "start_date": str(start_date),
-                "end_date": str(end_date),
-                "interval": interval,
-                "feature_cols": feat_cols,
-                "model_file": None,
-                "training_params": {"num_boost_round": int(num_boost), "early_stopping_rounds": int(early_stop), "test_size": float(test_size)},
-                "health_thresholds": {"buy_threshold": float(buy_threshold), "sell_threshold": float(sell_threshold)},
-                "p_fast": float(p_fast), "p_slow": float(p_slow), "p_deep": float(p_deep),
+                "run_id": run_id, "symbol": symbol, "start_date": str(start_date),
+                "end_date": str(end_date), "interval": interval,
+                "feature_cols": feat_cols, "training_params": {"num_boost": num_boost, "early_stop": early_stop, "test_size": test_size}
             }
             backtest_metrics = {
-                "num_trades": int(0 if trades is None else len(trades)),
-                "total_pnl": float(0.0 if trades is None or trades.empty else trades["pnl"].sum()),
-                "win_rate": float(0.0 if trades is None or trades.empty else (trades["pnl"] > 0).mean()),
-                "latest_health": float(latest_health),
+                "num_trades": int(len(trades)),
+                "total_pnl": float(trades["pnl"].sum() if not trades.empty else 0.0),
+                "win_rate": float((trades["pnl"] > 0).mean() if not trades.empty else 0.0),
             }
-            combined_metrics = {}
-            combined_metrics.update(metrics if isinstance(metrics, dict) else {})
-            combined_metrics.update(backtest_metrics)
-
+            combined = {}
+            combined.update(metrics if isinstance(metrics, dict) else {})
+            combined.update(backtest_metrics)
             trade_list = []
-            if trades is not None and not trades.empty:
+            if not trades.empty:
                 for r in trades.to_dict(orient="records"):
                     trade_list.append({
                         "candidate_time": str(r.get("entry_time")),
-                        "layer": None,
-                        "size": float(0.0),
                         "entry_price": float(r.get("entry_price") or 0.0),
-                        "filled_at": str(r.get("exit_time") or ""),
-                        "ret": float(r.get("pnl") or 0.0),
-                        "pnl": float(r.get("pnl") or 0.0),
+                        "exit_time": str(r.get("exit_time")),
+                        "ret": float(r.get("pnl") or 0.0)
                     })
+            run_id_returned = supa.log_run(metrics=combined, metadata=metadata, trades=trade_list)
+            st.success(f"Logged run {run_id_returned}")
 
-            run_id_returned = supa.log_run(metrics=combined_metrics, metadata=metadata, trades=trade_list)
-            st.success(f"Logged run to Supabase with run_id: {run_id_returned}")
-        except Exception as e:
-            logger.exception("Supabase log failed: %s", e)
-            st.error(f"Failed to log to Supabase: {e}")
+            # After logging, fetch recent runs and pick top3 by your weighting and offer saving
+            runs = supa.fetch_runs(symbol=symbol, limit=20)
+            top_runs = pick_top_runs_by_metrics(runs, top_n=3)
+            st.subheader("Top 3 recent runs (by total_pnl then win_rate)")
+            for rr in top_runs:
+                st.write(rr)
 
-    # Breadth / sweep handlers
-    if run_breadth:
-        st.info("Running breadth backtest...")
-        breadth_results = run_breadth_backtest(clean, bars, symbol=symbol)
-        st.subheader("Breadth Summary")
-        st.dataframe(pd.DataFrame(breadth_results.get("summary", [])))
-        # show detailed
-        for mode, df in breadth_results.get("detailed_trades", {}).items():
-            if df is None or df.empty:
-                st.info(f"No trades for mode {mode}")
-                continue
-            with st.expander(f"{mode} — {len(df)} trades"):
-                st.dataframe(df.head(200))
+            # Save model locally
+            model_basename = f"confirm_model_{symbol.replace('=','_')}"
+            saved_paths = export_model_and_metadata(model_wrap, feat_cols, combined, model_basename, save_fi=True)
+            st.success(f"Saved model files: {saved_paths}")
+        except Exception as exc:
+            logger.exception("Logging/saving failed: %s", exc)
+            st.error(f"Logging/saving failed: {exc}")
 
-    if run_sweep_btn:
-        st.info("Running sweep grid...")
-        sweep_results = run_sweep(clean, bars, symbol=symbol)
-        st.subheader("Sweep Results")
-        st.write({k: (v.get("trades") if isinstance(v, dict) else None) for k,v in sweep_results.items()})
+# Breadth handler
+if run_breadth:
+    st.info("Running breadth backtest across 3 levels...")
+    # assemble levels_config
+    levels = {
+        "L1": {"buy_th": float(lvl1_buy), "sell_th": float(lvl1_sell), "rr_min": float(lvl1_rr_min), "rr_max": float(lvl1_rr_max), "sl_min": float(lvl1_sl_min), "sl_max": float(lvl1_sl_max)},
+        "L2": {"buy_th": float(lvl2_buy), "sell_th": float(lvl2_sell), "rr_min": float(lvl2_rr_min), "rr_max": float(lvl2_rr_max), "sl_min": float(lvl2_sl_min), "sl_max": float(lvl2_sl_max)},
+        "L3": {"buy_th": float(lvl3_buy), "sell_th": float(lvl3_sell), "rr_min": float(lvl3_rr_min), "rr_max": float(lvl3_rr_max), "sl_min": float(lvl3_sl_min), "sl_max": float(lvl3_sl_max)}
+    }
+    # Need candidates / bars; try to fetch or require run_main_pipeline first
+    bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
+    bars = ensure_unique_index(bars)
+    bars["rvol"] = compute_rvol(bars, 20)
+    cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+    if cands is None or cands.empty:
+        st.error("No candidates available for breadth run.")
+    else:
+        # seed a minimal pred_prob if not present
+        cands["pred_prob"] = cands.get("pred_prob", 0.0)
+        # run breadth
+        try:
+            res = run_breadth_backtest(clean=cands, bars=bars, levels_config=levels, feature_cols=feat_cols_default, model_train_kwargs={"max_bars": 60})
+            summary_df = pd.DataFrame(res.get("summary", []))
+            st.subheader("Breadth Summary")
+            if not summary_df.empty:
+                st.dataframe(summary_df)
+            else:
+                st.warning("Breadth run returned no summary rows.")
+            detailed = res.get("detailed_trades", {})
+            for lvl, df in detailed.items():
+                st.subheader(f"{lvl} — {len(df)} trades")
+                st.dataframe(df.head(50))
+        except Exception as exc:
+            logger.exception("Breadth backtest failed: %s", exc)
+            st.error(f"Breadth backtest failed: {exc}")
 
-# run streamlit app
-if st.button("Run main pipeline"):
-    try:
-        run_main_pipeline()
-    except Exception as e:
-        logger.exception("Pipeline failed: %s", e)
-        st.error(f"Pipeline failed: {e}")
+# Grid sweep handler
+if run_sweep_btn:
+    st.info("Running grid sweep (RR x SL x MPT)...")
+    bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
+    bars = ensure_unique_index(bars)
+    bars["rvol"] = compute_rvol(bars, 20)
+    cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+    if cands is None or cands.empty:
+        st.error("No candidates for sweep.")
+    else:
+        # assemble rr_vals, sl_ranges, mpt_list from UI (defaults from sidebar)
+        rr_vals = [lvl1_rr_min, lvl1_rr_max, lvl2_rr_min, lvl2_rr_max, lvl3_rr_min, lvl3_rr_max]
+        rr_vals = sorted(list(set([float(round(x, 2)) for x in rr_vals if x is not None])))
+        sl_ranges = [(float(lvl1_sl_min), float(lvl1_sl_max)), (float(lvl2_sl_min), float(lvl2_sl_max)), (float(lvl3_sl_min), float(lvl3_sl_max))]
+        mpt_list = [float(p_fast), float(p_slow), float(p_deep)]
+        try:
+            sweep_results = run_grid_sweep(clean=cands, bars=bars, rr_vals=rr_vals, sl_ranges=sl_ranges, mpt_list=mpt_list, feature_cols=feat_cols_default, model_train_kwargs={"max_bars":60})
+            # summarize best by total trades/pnl
+            summary_rows = []
+            for k, v in sweep_results.items():
+                if isinstance(v, dict) and "overlay" in v and not v["overlay"].empty:
+                    s = summarize_trades(v["overlay"])
+                    if not s.empty:
+                        r = s.iloc[0].to_dict()
+                        r.update({"config": k, "trades_count": v.get("trades_count", 0)})
+                        summary_rows.append(r)
+            if summary_rows:
+                sdf = pd.DataFrame(summary_rows).sort_values("total_pnl", ascending=False).reset_index(drop=True)
+                st.subheader("Sweep summary (top configs)")
+                st.dataframe(sdf.head(20))
+                st.download_button("Download sweep summary CSV", df_to_csv_bytes(sdf), "sweep_summary.csv", "text/csv")
+            else:
+                st.warning("Sweep returned no runs with trades.")
+        except Exception as exc:
+            logger.exception("Sweep failed: %s", exc)
+            st.error(f"Sweep failed: {exc}")
+
+# Show basic help
+st.sidebar.markdown("### Notes\n- Level thresholds adjust the breadth backtest behaviors.\n- Breadth returns per-level trade lists and summaries.\n- Save/Log model after a successful training run.")
+
+# End of file
