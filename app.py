@@ -1,5 +1,5 @@
 # app.py — Entry-Range Triangulation (integrated single-file)
-# Chunk 1/7: imports + Streamlit UI + level configs + data fetcher
+# Chunk 1/7: imports + logging + Streamlit UI + redesigned level controls + fetch_price
 
 import os
 import io
@@ -29,35 +29,22 @@ try:
     from yahooquery import Ticker as YahooTicker
 except Exception:
     YahooTicker = None
-
 try:
     import xgboost as xgb
 except Exception:
     xgb = None
-
 try:
     from supabase import create_client, Client
 except Exception:
     create_client = None
     Client = None
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-except Exception:
-    torch = None
-    nn = None
-    optim = None
-
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("entry_triangulation_app")
 logger.setLevel(logging.INFO)
 
-# ---------------------------
-# Streamlit page & UI inputs
-# ---------------------------
+# Streamlit layout + page
 st.set_page_config(page_title="Entry-Range Triangulation", layout="wide")
 st.title("Entry-Range Triangulation Dashboard — Multi-level (3) Models")
 
@@ -67,84 +54,100 @@ start_date = st.date_input("Start date", value=datetime.today() - timedelta(days
 end_date = st.date_input("End date", value=datetime.today())
 interval = st.selectbox("Interval", ["1d", "1h", "15m", "5m", "1m"], index=0)
 
-# HealthGauge gating
-st.sidebar.header("HealthGauge")
-buy_threshold_global = st.sidebar.number_input("Global buy threshold (for gating)", 0.0, 10.0, 5.5)
-sell_threshold_global = st.sidebar.number_input("Global sell threshold (for gating)", 0.0, 10.0, 4.5)
+# High level gating / training
+st.sidebar.header("Global / Model")
+buy_threshold_global = st.sidebar.number_input("Global buy threshold (not used directly)", 0.0, 10.0, 5.5)
+sell_threshold_global = st.sidebar.number_input("Global sell threshold (not used directly)", 0.0, 10.0, 4.5)
 force_run = st.sidebar.checkbox("Force run even if gating fails", value=False)
 
-# XGBoost / training
-st.sidebar.header("Training")
 num_boost = int(st.sidebar.number_input("XGBoost rounds", min_value=1, value=200))
 early_stop = int(st.sidebar.number_input("Early stopping rounds", min_value=1, value=20))
 test_size = float(st.sidebar.number_input("Validation fraction", min_value=0.01, max_value=0.5, value=0.2))
 
-# Confirm thresholds
 p_fast = st.sidebar.number_input("Confirm threshold (fast)", 0.0, 1.0, 0.60)
 p_slow = st.sidebar.number_input("Confirm threshold (slow)", 0.0, 1.0, 0.55)
 p_deep = st.sidebar.number_input("Confirm threshold (deep)", 0.0, 1.0, 0.45)
 
-# Level-specific configs (user requested)
-st.sidebar.header("Level 1 (Scope)")
-lvl1_buy = st.sidebar.number_input("L1 buy threshold (signal)", 0.0, 10.0, 5.5, step=0.1)
-lvl1_sell = st.sidebar.number_input("L1 sell threshold (signal)", 0.0, 10.0, 4.5, step=0.1)
-lvl1_rr_min = st.sidebar.number_input("L1 RR min", 0.1, 10.0, 1.0, step=0.1)
-lvl1_rr_max = st.sidebar.number_input("L1 RR max", 0.1, 10.0, 2.5, step=0.1)
-lvl1_sl_min = st.sidebar.number_input("L1 SL min (pct)", 0.001, 0.5, 0.02, step=0.001)
-lvl1_sl_max = st.sidebar.number_input("L1 SL max (pct)", 0.001, 0.5, 0.04, step=0.001)
+# Redesigned Level controls: explicit buy_min/buy_max and sell_min/sell_max for each level
+st.sidebar.header("Level Thresholds (explicit min / max)")
 
-st.sidebar.header("Level 2 (Focus)")
-lvl2_buy = st.sidebar.number_input("L2 buy threshold (signal)", 0.0, 10.0, 6.0, step=0.1)
-lvl2_sell = st.sidebar.number_input("L2 sell threshold (signal)", 0.0, 10.0, 4.0, step=0.1)
-lvl2_rr_min = st.sidebar.number_input("L2 RR min", 0.1, 10.0, 2.0, step=0.1)
-lvl2_rr_max = st.sidebar.number_input("L2 RR max", 0.1, 10.0, 3.5, step=0.1)
-lvl2_sl_min = st.sidebar.number_input("L2 SL min (pct)", 0.001, 0.5, 0.01, step=0.001)
-lvl2_sl_max = st.sidebar.number_input("L2 SL max (pct)", 0.001, 0.5, 0.03, step=0.001)
+def level_ui_group(level_name: str, default):
+    st.sidebar.subheader(level_name)
+    buy_min = st.sidebar.number_input(f"{level_name} buy_min", 0.0, 10.0, default["buy_min"], step=0.1, key=f"{level_name}_buy_min")
+    buy_max = st.sidebar.number_input(f"{level_name} buy_max", 0.0, 10.0, default["buy_max"], step=0.1, key=f"{level_name}_buy_max")
+    sell_min = st.sidebar.number_input(f"{level_name} sell_min", 0.0, 10.0, default["sell_min"], step=0.1, key=f"{level_name}_sell_min")
+    sell_max = st.sidebar.number_input(f"{level_name} sell_max", 0.0, 10.0, default["sell_max"], step=0.1, key=f"{level_name}_sell_max")
+    rr_min = st.sidebar.number_input(f"{level_name} RR min", 0.1, 20.0, default["rr_min"], step=0.1, key=f"{level_name}_rr_min")
+    rr_max = st.sidebar.number_input(f"{level_name} RR max", 0.1, 20.0, default["rr_max"], step=0.1, key=f"{level_name}_rr_max")
+    sl_min = st.sidebar.number_input(f"{level_name} SL min (pct)", 0.000, 0.5, default["sl_min"], step=0.001, key=f"{level_name}_sl_min")
+    sl_max = st.sidebar.number_input(f"{level_name} SL max (pct)", 0.000, 0.5, default["sl_max"], step=0.001, key=f"{level_name}_sl_max")
+    return {
+        "buy_min": float(buy_min), "buy_max": float(buy_max),
+        "sell_min": float(sell_min), "sell_max": float(sell_max),
+        "rr_min": float(rr_min), "rr_max": float(rr_max),
+        "sl_min": float(sl_min), "sl_max": float(sl_max)
+    }
 
-st.sidebar.header("Level 3 (Triangulation)")
-lvl3_buy = st.sidebar.number_input("L3 buy threshold (signal)", 0.0, 10.0, 6.5, step=0.1)
-lvl3_sell = st.sidebar.number_input("L3 sell threshold (signal)", 0.0, 10.0, 3.5, step=0.1)
-lvl3_rr_min = st.sidebar.number_input("L3 RR min", 0.1, 10.0, 3.0, step=0.1)
-lvl3_rr_max = st.sidebar.number_input("L3 RR max", 0.1, 10.0, 5.0, step=0.1)
-lvl3_sl_min = st.sidebar.number_input("L3 SL min (pct)", 0.001, 0.5, 0.005, step=0.001)
-lvl3_sl_max = st.sidebar.number_input("L3 SL max (pct)", 0.001, 0.5, 0.02, step=0.001)
+# sensible defaults for L1/L2/L3
+lvl1_default = {"buy_min":5.5, "buy_max":6.0, "sell_min":4.5, "sell_max":5.0, "rr_min":1.0, "rr_max":2.5, "sl_min":0.02, "sl_max":0.04}
+lvl2_default = {"buy_min":6.0, "buy_max":6.5, "sell_min":4.0, "sell_max":4.9, "rr_min":2.0, "rr_max":3.5, "sl_min":0.01, "sl_max":0.03}
+lvl3_default = {"buy_min":6.5, "buy_max":10.0, "sell_min":0.0, "sell_max":3.5, "rr_min":3.0, "rr_max":5.0, "sl_min":0.005, "sl_max":0.02}
+
+st.sidebar.markdown("**Configure Level ranges** — ensure ranges do not overlap to keep exclusivity.")
+L1 = level_ui_group("L1", lvl1_default)
+L2 = level_ui_group("L2", lvl2_default)
+L3 = level_ui_group("L3", lvl3_default)
 
 # Breadth & sweep controls
 st.sidebar.header("Breadth & Sweep")
 run_breadth = st.sidebar.button("Run breadth backtest (3 levels)")
 run_sweep_btn = st.sidebar.button("Run grid sweep")
 
-
-# fetch price: using yahooquery
+# Fetch price helper (yahooquery then yfinance fallback)
 def fetch_price(symbol: str, start: Optional[str] = None, end: Optional[str] = None, interval: str = "1d") -> pd.DataFrame:
-    if YahooTicker is None:
-        st.error("yahooquery not installed; install `yahooquery` to fetch price data.")
-        return pd.DataFrame()
+    """
+    Robust fetcher: tries yahooquery, falls back to yfinance. Normalizes OHLC column names to lowercase.
+    """
+    # try yahooquery
+    if YahooTicker is not None:
+        try:
+            tq = YahooTicker(symbol)
+            raw = tq.history(start=start, end=end, interval=interval)
+            if raw is not None and len(raw) > 0:
+                if isinstance(raw, dict):
+                    raw = pd.DataFrame(raw)
+                if isinstance(raw.index, pd.MultiIndex):
+                    raw = raw.reset_index(level=0, drop=True)
+                raw.index = pd.to_datetime(raw.index)
+                raw = raw.sort_index()
+                raw.columns = [str(c).lower() for c in raw.columns]
+                if "adjclose" in raw.columns and "close" not in raw.columns:
+                    raw["close"] = raw["adjclose"]
+                return raw[~raw.index.duplicated(keep="first")]
+        except Exception:
+            logger.exception("yahooquery fetch failed, will try fallback")
+
+    # fallback to yfinance if available
     try:
-        tq = YahooTicker(symbol)
-        raw = tq.history(start=start, end=end, interval=interval)
-        if raw is None:
+        import yfinance as yf
+        df = yf.download(symbol, start=start, end=end, interval=interval, progress=False)
+        if df is None or df.empty:
             return pd.DataFrame()
-        if isinstance(raw, dict):
-            raw = pd.DataFrame(raw)
-        if isinstance(raw.index, pd.MultiIndex):
-            raw = raw.reset_index(level=0, drop=True)
-        raw.index = pd.to_datetime(raw.index)
-        raw = raw.sort_index()
-        raw.columns = [c.lower() for c in raw.columns]
-        if "close" not in raw.columns and "adjclose" in raw.columns:
-            raw["close"] = raw["adjclose"]
-        return raw[~raw.index.duplicated(keep="first")]
-    except Exception as exc:
-        logger.error("fetch_price failed: %s", exc)
-        return pd.DataFrame()
-# Chunk 2/7: features + labeling
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        df.columns = [str(c).lower() for c in df.columns]
+        if "adjclose" in df.columns and "close" not in df.columns:
+            df["close"] = df["adjclose"]
+        return df[~df.index.duplicated(keep="first")]
+    except Exception:
+        logger.exception("yfinance fallback failed")
+    # return empty with consistent columns
+    return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+# Chunk 2/7: features + robust candidate generation
 
 def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    if "volume" not in df.columns:
-        return pd.Series(1.0, index=df.index)
+    if df is None or df.empty or "volume" not in df.columns:
+        return pd.Series(1.0, index=df.index if df is not None else [])
     rolling = df["volume"].rolling(window=lookback, min_periods=1).mean()
     return (df["volume"] / rolling.replace(0, np.nan)).fillna(1.0)
 
@@ -159,13 +162,10 @@ def calculate_health_gauge(cot_df: pd.DataFrame, daily_bars: pd.DataFrame, thres
 def ensure_unique_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return df
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
     if df.index.duplicated().any():
         df = df[~df.index.duplicated(keep="first")]
     return df.sort_index()
 
-# Labeling helpers
 def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1).fillna(close.iloc[0])
     tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
@@ -181,26 +181,52 @@ def generate_candidates_and_labels(
     direction: str = "long"
 ) -> pd.DataFrame:
     """
-    Generate candidates and triple-barrier-like labels. Defaults to 'long' logic as pipeline uses long entries.
+    Tolerant candidate generator that adapts lookback for short series and logs diagnostics.
     """
     if bars is None or bars.empty:
+        logger.info("generate_candidates_and_labels: bars empty")
         return pd.DataFrame()
     bars = bars.copy()
     bars.index = pd.to_datetime(bars.index)
     bars = ensure_unique_index(bars)
-    for col in ("high", "low", "close"):
-        if col not in bars.columns:
-            raise KeyError(f"Missing column {col}")
 
-    bars["tr"] = _true_range(bars["high"], bars["low"], bars["close"])
-    bars["atr"] = bars["tr"].rolling(window=atr_window, min_periods=1).mean()
+    # normalize columns
+    colmap = {c.lower(): c for c in bars.columns}
+    if "high" not in colmap or "low" not in colmap or "close" not in colmap:
+        logger.warning("OHLC columns missing in input bars: %s", list(bars.columns))
+        # try common alternatives
+        for alt in ("h", "high_", "high."):
+            if alt in colmap:
+                colmap["high"] = colmap[alt]
+        for alt in ("l", "low_", "low."):
+            if alt in colmap:
+                colmap["low"] = colmap[alt]
+        for alt in ("adjclose", "close_", "price"):
+            if alt in colmap:
+                colmap["close"] = colmap[alt]
+    if not set(["high", "low", "close"]).issubset(set(colmap.keys())):
+        logger.warning("Unable to find required OHLC even after heuristics. cols=%s", list(bars.columns))
+        return pd.DataFrame()
 
-    recs: List[Dict[str, Any]] = []
-    n = len(bars)
-    for i in range(lookback, n):
-        t = bars.index[i]
-        entry_px = float(bars["close"].iat[i])
-        atr = float(bars["atr"].iat[i])
+    df = pd.DataFrame(index=bars.index)
+    df["high"] = bars[colmap["high"]].astype(float)
+    df["low"] = bars[colmap["low"]].astype(float)
+    df["close"] = bars[colmap["close"]].astype(float)
+    df["volume"] = bars[colmap.get("volume")] if colmap.get("volume") in bars.columns else np.nan
+
+    n = len(df)
+    effective_lookback = int(min(lookback, max(5, n // 3)))
+    if n <= effective_lookback + 2:
+        logger.info("generate_candidates_and_labels: not enough bars for requested lookback (%d). n=%d", lookback, n)
+
+    df["tr"] = _true_range(df["high"], df["low"], df["close"])
+    df["atr"] = df["tr"].rolling(window=atr_window, min_periods=1).mean()
+
+    recs = []
+    for i in range(effective_lookback, n):
+        t = df.index[i]
+        entry_px = float(df["close"].iat[i])
+        atr = float(df["atr"].iat[i])
         if atr <= 0 or math.isnan(atr):
             continue
 
@@ -214,10 +240,10 @@ def generate_candidates_and_labels(
         end_idx = min(i + max_bars, n - 1)
         label = 0
         hit_idx = end_idx
-        hit_px = float(bars["close"].iat[end_idx])
+        hit_px = float(df["close"].iat[end_idx])
 
         for j in range(i + 1, end_idx + 1):
-            hi = float(bars["high"].iat[j]); lo = float(bars["low"].iat[j])
+            hi = float(df["high"].iat[j]); lo = float(df["low"].iat[j])
             if direction == "long":
                 if hi >= tp_px:
                     label, hit_idx, hit_px = 1, j, tp_px
@@ -233,7 +259,7 @@ def generate_candidates_and_labels(
                     label, hit_idx, hit_px = 0, j, sl_px
                     break
 
-        end_t = bars.index[hit_idx]
+        end_t = df.index[hit_idx]
         realized_return = (hit_px - entry_px) / entry_px if direction == "long" else (entry_px - hit_px) / entry_px
         dur_min = (end_t - t).total_seconds() / 60.0
 
@@ -249,9 +275,10 @@ def generate_candidates_and_labels(
             "realized_return": float(realized_return),
             "direction": direction
         })
-    return pd.DataFrame(recs)
-
-# Chunk 3/7: backtest + summarization
+    out_df = pd.DataFrame(recs)
+    logger.info("generate_candidates_and_labels: produced %d candidates (n_bars=%d, lookback=%d)", len(out_df), n, effective_lookback)
+    return out_df
+# Chunk 3/7: simulate_limits and summary utilities
 
 def simulate_limits(df: pd.DataFrame,
                     bars: pd.DataFrame,
@@ -260,6 +287,9 @@ def simulate_limits(df: pd.DataFrame,
                     sl: float = 0.02,
                     tp: float = 0.04,
                     max_holding: int = 60) -> pd.DataFrame:
+    """
+    Light simulation using SL/TP percentages. Assumes df contains candidate_time (timestamp index).
+    """
     if df is None or df.empty or bars is None or bars.empty:
         return pd.DataFrame()
     trades = []
@@ -347,7 +377,7 @@ def combine_summaries(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
 
-# Chunk 4/7: model training (xgboost), prediction and export helpers
+# Chunk 4/7: XGBoost wrapper, train/predict, export helpers
 
 class BoosterWrapper:
     def __init__(self, booster, feature_names: List[str]):
@@ -369,19 +399,11 @@ class BoosterWrapper:
         return pd.Series(raw, index=X.index, name="confirm_proba")
 
     def save_model(self, path: str):
-        try:
-            self.booster.save_model(path)
-        except Exception:
-            joblib.dump(self.booster, path)
+        self.booster.save_model(path)
 
     def feature_importance(self) -> pd.DataFrame:
-        imp = {}
-        try:
-            imp = self.booster.get_score(importance_type="gain")
-        except Exception:
-            pass
-        return (pd.DataFrame([(f, float(imp.get(f, 0.0))) for f in self.feature_names],
-                             columns=["feature", "gain"])
+        imp = self.booster.get_score(importance_type="gain")
+        return (pd.DataFrame([(f, imp.get(f, 0.0)) for f in self.feature_names], columns=["feature", "gain"])
                 .sort_values("gain", ascending=False).reset_index(drop=True))
 
 def train_xgb_confirm(clean: pd.DataFrame,
@@ -459,31 +481,57 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
         logger.exception("Failed to export model: %s", exc)
     return paths
 
-# Chunk 5/7: breadth_backtest (multi-level) + sweep/grid search — explicit min/max scopes
 
-def _compute_explicit_windows(levels_config: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Tuple[float, float]]]:
+# Chunk 5/7: breadth_backtest (multi-level exclusive ranges) + grid sweep
+
+def _validate_and_fix_level_ranges(levels: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
     """
-    Given levels_config with per-level buy_th and sell_th, return explicit non-overlapping windows:
-      return { level: {"buy": (buy_min, buy_max), "sell": (sell_min, sell_max)} }
-    buy windows: [buy_min, buy_max)  (upper exclusive); highest level => upper = +inf
-    sell windows: (sell_min, sell_max] (lower exclusive); lowest level => lower = -inf
+    Ensure exclusivity: buy ranges and sell ranges should not overlap across levels.
+    If small overlaps exist we adjust boundaries slightly (with warnings).
+    Returns (fixed_levels, diagnostics)
     """
-    out: Dict[str, Dict[str, Tuple[float, float]]] = {}
-    # Build buy windows (descending by buy_th)
-    buy_list = sorted([(lvl, cfg.get("buy_th", 0.0)) for lvl, cfg in levels_config.items()], key=lambda x: x[1], reverse=True)
-    for i, (lvl, buy_th) in enumerate(buy_list):
-        upper = buy_list[i - 1][1] if i - 1 >= 0 else np.inf
-        lower = buy_th
-        out.setdefault(lvl, {})["buy"] = (float(lower), float(upper))
-
-    # Build sell windows (ascending by sell_th)
-    sell_list = sorted([(lvl, cfg.get("sell_th", 0.0)) for lvl, cfg in levels_config.items()], key=lambda x: x[1])
-    for i, (lvl, sell_th) in enumerate(sell_list):
-        lower = sell_list[i - 1][1] if i - 1 >= 0 else -np.inf
-        upper = sell_th
-        out.setdefault(lvl, {})["sell"] = (float(lower), float(upper))
-
-    return out
+    diags = []
+    # Build sorted buy_min for checking
+    # We'll primarily ensure buy ranges are increasing L1->L2->L3 and sell ranges decreasing accordingly if needed
+    # Simple policy: enforce buy_min(L1) <= buy_max(L1) < buy_min(L2) <= buy_max(L2) < buy_min(L3)
+    lvl_keys = list(levels.keys())
+    fixed = {k: dict(v) for k, v in levels.items()}
+    # Fix buy ranges
+    prev_buy_max = -1e9
+    for k in lvl_keys:
+        bmin, bmax = fixed[k]["buy_min"], fixed[k]["buy_max"]
+        if bmax < bmin:
+            fixed[k]["buy_max"] = bmin
+            diags.append(f"{k}: buy_max < buy_min, set buy_max=buy_min")
+        if bmin <= prev_buy_max:
+            # push bmin to prev_buy_max + small epsilon
+            new_bmin = round(prev_buy_max + 0.01, 2)
+            if new_bmin > bmax:
+                fixed[k]["buy_max"] = new_bmin
+                fixed[k]["buy_min"] = new_bmin
+                diags.append(f"{k}: raised both buy_min & buy_max to {new_bmin} to enforce exclusivity")
+            else:
+                fixed[k]["buy_min"] = new_bmin
+                diags.append(f"{k}: raised buy_min to {new_bmin} to avoid overlap")
+        prev_buy_max = fixed[k]["buy_max"]
+    # Fix sell ranges similarly (we allow sell ranges to be independent but require they don't overlap with others)
+    prev_sell_min = 1e9
+    for k in reversed(lvl_keys):
+        smin, smax = fixed[k]["sell_min"], fixed[k]["sell_max"]
+        if smax < smin:
+            fixed[k]["sell_max"] = smin
+            diags.append(f"{k}: sell_max < sell_min, set sell_max=sell_min")
+        if smax >= prev_sell_min:
+            new_smax = round(prev_sell_min - 0.01, 2)
+            if new_smax < smin:
+                fixed[k]["sell_min"] = new_smax
+                fixed[k]["sell_max"] = new_smax
+                diags.append(f"{k}: lowered both sell_min & sell_max to {new_smax} to enforce exclusivity")
+            else:
+                fixed[k]["sell_max"] = new_smax
+                diags.append(f"{k}: lowered sell_max to {new_smax} to avoid overlap")
+        prev_sell_min = fixed[k]["sell_min"]
+    return fixed, diags
 
 def run_breadth_backtest(clean: pd.DataFrame,
                          bars: pd.DataFrame,
@@ -491,65 +539,74 @@ def run_breadth_backtest(clean: pd.DataFrame,
                          feature_cols: List[str],
                          model_train_kwargs: Dict[str,Any]) -> Dict[str, Any]:
     """
-    For each level, apply explicit buy/sell windows (non-overlapping) and simulate trades.
-    Returns standardized dict with per-level trades and a combined summary list.
+    Uses explicit level ranges: buy_min..buy_max and sell_min..sell_max.
+    For each level we filter candidates whose 'signal' falls inside that level's buy range (or sell range)
+    and simulate using average RR/SL from config.
     """
-    out: Dict[str, Any] = {"summary": [], "detailed_trades": {}, "diagnostics": []}
+    out = {"summary": [], "detailed_trades": {}, "diagnostics": []}
     if clean is None or clean.empty:
         out["diagnostics"].append("No candidate set provided.")
         return out
 
-    windows = _compute_explicit_windows(levels_config)
+    # validate and fix ranges to ensure exclusivity
+    fixed_levels, diags = _validate_and_fix_level_ranges(levels_config)
+    out["diagnostics"].extend(diags)
 
-    # create numeric 'signal' if missing
-    df_base = clean.copy()
-    if "signal" not in df_base.columns:
-        if "pred_prob" in df_base.columns:
-            df_base["signal"] = (df_base["pred_prob"] * 10).round().astype(int)
+    # Ensure signal column exists
+    df_all = clean.copy()
+    if "signal" not in df_all.columns:
+        if "pred_prob" in df_all.columns:
+            df_all["signal"] = (df_all["pred_prob"] * 10).round().astype(int)
         else:
-            df_base["signal"] = 0
+            # fallback: scale realized_return to 0-10 for demonstration
+            if "realized_return" in df_all.columns:
+                scaled = (df_all["realized_return"] - df_all["realized_return"].min()) / max(1e-9, (df_all["realized_return"].max() - df_all["realized_return"].min()))
+                df_all["signal"] = (scaled * 10).round().astype(int)
+            else:
+                df_all["signal"] = 0
 
-    # For each level, filter using explicit windows (buy and sell) and simulate
-    for lvl_name, cfg in levels_config.items():
+    for lvl_name, cfg in fixed_levels.items():
         try:
-            w = windows.get(lvl_name, {})
-            buy_min, buy_max = w.get("buy", (cfg.get("buy_th", 0.0), np.inf))
-            sell_min, sell_max = w.get("sell", (-np.inf, cfg.get("sell_th", 0.0)))
+            buy_min = cfg.get("buy_min")
+            buy_max = cfg.get("buy_max")
+            sell_min = cfg.get("sell_min")
+            sell_max = cfg.get("sell_max")
+            rr_min = cfg.get("rr_min")
+            rr_max = cfg.get("rr_max")
+            sl_min = cfg.get("sl_min")
+            sl_max = cfg.get("sl_max")
 
-            df = df_base.copy()
-            df["assigned"] = False
-            df["pred_label"] = 0
+            # Filter candidates for the level: signal within buy range OR within sell range
+            df = df_all.copy()
+            cond_buy = (df["signal"] >= buy_min) & (df["signal"] <= buy_max)
+            cond_sell = (df["signal"] >= sell_min) & (df["signal"] <= sell_max)
+            df_level = df[cond_buy | cond_sell].copy()
+            if df_level.empty:
+                out["detailed_trades"][lvl_name] = pd.DataFrame()
+                out["diagnostics"].append(f"{lvl_name}: no candidates in specified ranges")
+                continue
 
-            # Buy mask: signal in [buy_min, buy_max)
-            buy_mask = (df["signal"] >= buy_min) & (df["signal"] < buy_max)
-            # Sell mask: signal in (sell_min, sell_max] => (df["signal"] > sell_min) & (df["signal"] <= sell_max)
-            sell_mask = (df["signal"] > sell_min) & (df["signal"] <= sell_max)
+            # assign labels using ranges (buy -> 1, sell -> -1)
+            df_level["pred_label"] = 0
+            df_level.loc[cond_buy.loc[df_level.index], "pred_label"] = 1
+            df_level.loc[cond_sell.loc[df_level.index], "pred_label"] = -1
 
-            # Assign buys first, then sells (masks are non-overlapping across levels by construction of windows)
-            df.loc[buy_mask & (~df["assigned"]), "pred_label"] = 1
-            df.loc[buy_mask, "assigned"] = True
-            df.loc[sell_mask & (~df["assigned"]), "pred_label"] = -1
-            df.loc[sell_mask, "assigned"] = True
-
-            # Representative SL and TP from level config (mean)
-            sl_pct = float((cfg.get("sl_min", 0.01) + cfg.get("sl_max", 0.02)) / 2.0)
-            rr = float((cfg.get("rr_min", 1.0) + cfg.get("rr_max", 2.0)) / 2.0)
+            # represent sl/tp as mean values
+            sl_pct = float((sl_min + sl_max) / 2.0)
+            rr = float((rr_min + rr_max) / 2.0)
             tp_pct = rr * sl_pct
 
-            trades = simulate_limits(df, bars, label_col="pred_label",
-                                     sl=sl_pct, tp=tp_pct,
-                                     max_holding=int(model_train_kwargs.get("max_bars", 60)))
-            out["detailed_trades"][lvl_name] = trades if isinstance(trades, pd.DataFrame) else pd.DataFrame()
-            summary = summarize_trades(trades)
-            if not summary.empty:
-                srow = summary.iloc[0].to_dict()
-                srow.update({"mode": lvl_name, "sl_pct": sl_pct, "tp_pct": tp_pct})
-                out["summary"].append(srow)
-            out["diagnostics"].append(f"{lvl_name}: buy_range=[{buy_min},{buy_max}), sell_range=({sell_min},{sell_max}], sl={sl_pct:.4f}, tp={tp_pct:.4f}, trades={len(trades)}")
+            trades = simulate_limits(df_level, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
+            out["detailed_trades"][lvl_name] = trades
+            s = summarize_trades(trades)
+            if not s.empty:
+                s_row = s.iloc[0].to_dict()
+                s_row.update({"mode": lvl_name, "sl_pct": sl_pct, "tp_pct": tp_pct, "n_candidates": len(df_level)})
+                out["summary"].append(s_row)
+            out["diagnostics"].append(f"{lvl_name}: simulated {len(trades)} trades, sl={sl_pct:.4f}, tp={tp_pct:.4f}, candidates={len(df_level)}")
         except Exception as exc:
             logger.exception("Breadth level %s failed: %s", lvl_name, exc)
             out["diagnostics"].append(f"{lvl_name} error: {exc}")
-
     return out
 
 def run_grid_sweep(clean: pd.DataFrame,
@@ -560,10 +617,9 @@ def run_grid_sweep(clean: pd.DataFrame,
                    feature_cols: List[str],
                    model_train_kwargs: Dict[str,Any]) -> Dict[str, Any]:
     """
-    Sweep RR x SL ranges x model probability thresholds (mpt_list).
-    Returns dict keyed by config string with overlay and summary.
+    Sweep RR x SL-range x model-prob-threshold (mpt_list).
     """
-    results: Dict[str, Any] = {}
+    results = {}
     if clean is None or clean.empty:
         return results
     for rr in rr_vals:
@@ -581,13 +637,13 @@ def run_grid_sweep(clean: pd.DataFrame,
                             df["pred_prob"] = 0.0
                     df["pred_label"] = (df["pred_prob"] >= mpt).astype(int)
                     trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
-                    results[key] = {"trades_count": len(trades) if isinstance(trades, pd.DataFrame) else 0, "overlay": trades if isinstance(trades, pd.DataFrame) else pd.DataFrame()}
+                    results[key] = {"trades_count": len(trades), "overlay": trades}
                 except Exception as exc:
                     logger.exception("Sweep config %s failed: %s", key, exc)
                     results[key] = {"error": str(exc)}
     return results
 
-# Chunk 6/7: supabase logger (light wrapper), helpers, save & pick top3
+# Chunk 6/7: Supabase logger (light wrapper) + helpers + pick_top_runs
 
 class SupabaseLogger:
     def __init__(self):
@@ -631,19 +687,14 @@ class SupabaseLogger:
             raise RuntimeError(f"Failed to fetch trades: {resp.error}")
         return getattr(resp, "data", [])
 
-# Helpers
+# helpers
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     return buf.getvalue().encode()
 
 def pick_top_runs_by_metrics(runs: List[Dict], top_n: int = 3):
-    """
-    Ranks runs using weightings:
-      1) total_pnl (primary importance)
-      2) win_rate (secondary)
-    """
-    scored: List[Tuple[float, Any]] = []
+    scored = []
     for r in runs:
         metrics = r.get("metrics") if isinstance(r, dict) else r
         total_pnl = metrics.get("total_pnl", 0.0) if metrics else 0.0
@@ -653,9 +704,8 @@ def pick_top_runs_by_metrics(runs: List[Dict], top_n: int = 3):
     scored.sort(key=lambda x: x[0], reverse=True)
     return [item[1] for item in scored[:top_n]]
 
-# Chunk 7/7: main pipeline + UI actions + breadth/sweep handlers
+# Chunk 7/7: main pipeline + UI handlers (breadth / sweep)
 
-# small placeholders / defaults
 feat_cols_default = ["atr", "rvol", "duration", "hg"]
 
 def run_main_pipeline():
@@ -666,7 +716,6 @@ def run_main_pipeline():
         return
 
     bars = ensure_unique_index(bars)
-    # daily for health
     try:
         daily = bars.resample("1D").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
     except Exception:
@@ -679,14 +728,13 @@ def run_main_pipeline():
         st.warning("Health gating prevented run. Use 'Force run' to override.")
         return
 
-    # compute rvol and candidates
     bars["rvol"] = compute_rvol(bars, lookback=20)
     cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
     if cands is None or cands.empty:
         st.error("No candidates generated.")
         return
 
-    # add health-gauge to candidates (ffill to avoid FutureWarning)
+    # add health gauge per candidate by mapping candidate_time -> daily health
     if not health.empty:
         hg_map = health["health_gauge"].reindex(pd.to_datetime(health.index)).ffill().to_dict()
         cands["hg"] = cands["candidate_time"].dt.normalize().map(lambda t: hg_map.get(pd.Timestamp(t).normalize(), 0.0))
@@ -697,7 +745,7 @@ def run_main_pipeline():
     if "hg" not in feat_cols:
         feat_cols.append("hg")
 
-    # training confirm-stage (one model for pipeline)
+    # train confirm model
     st.info("Training confirm-stage XGBoost model…")
     try:
         model_wrap, metrics = train_xgb_confirm(cands, feat_cols, label_col="label",
@@ -711,7 +759,6 @@ def run_main_pipeline():
 
     st.write("Training metrics:", metrics)
 
-    # predict and simulate
     cands["pred_prob"] = predict_confirm_prob(model_wrap, cands, feat_cols)
     cands["pred_label"] = (cands["pred_prob"] >= p_fast).astype(int)
 
@@ -723,7 +770,7 @@ def run_main_pipeline():
         s = summarize_trades(trades)
         st.dataframe(s)
 
-    # Auto-log to Supabase (if configured) and then save model
+    # save & log
     if create_client is not None and st.button("Log run to Supabase and save model"):
         try:
             supa = SupabaseLogger()
@@ -753,14 +800,12 @@ def run_main_pipeline():
             run_id_returned = supa.log_run(metrics=combined, metadata=metadata, trades=trade_list)
             st.success(f"Logged run {run_id_returned}")
 
-            # After logging, fetch recent runs and pick top3 by weighting and offer saving
             runs = supa.fetch_runs(symbol=symbol, limit=20)
             top_runs = pick_top_runs_by_metrics(runs, top_n=3)
             st.subheader("Top 3 recent runs (by total_pnl then win_rate)")
             for rr in top_runs:
                 st.write(rr)
 
-            # Save model locally
             model_basename = f"confirm_model_{symbol.replace('=','_')}"
             saved_paths = export_model_and_metadata(model_wrap, feat_cols, combined, model_basename, save_fi=True)
             st.success(f"Saved model files: {saved_paths}")
@@ -771,23 +816,23 @@ def run_main_pipeline():
 # Breadth handler
 if run_breadth:
     st.info("Running breadth backtest across 3 levels...")
-    levels = {
-        "L1": {"buy_th": float(lvl1_buy), "sell_th": float(lvl1_sell), "rr_min": float(lvl1_rr_min), "rr_max": float(lvl1_rr_max), "sl_min": float(lvl1_sl_min), "sl_max": float(lvl1_sl_max)},
-        "L2": {"buy_th": float(lvl2_buy), "sell_th": float(lvl2_sell), "rr_min": float(lvl2_rr_min), "rr_max": float(lvl2_rr_max), "sl_min": float(lvl2_sl_min), "sl_max": float(lvl2_sl_max)},
-        "L3": {"buy_th": float(lvl3_buy), "sell_th": float(lvl3_sell), "rr_min": float(lvl3_rr_min), "rr_max": float(lvl3_rr_max), "sl_min": float(lvl3_sl_min), "sl_max": float(lvl3_sl_max)}
-    }
+    # gather level configs from UI variables L1/L2/L3
+    levels = {"L1": L1, "L2": L2, "L3": L3}
     bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
     bars = ensure_unique_index(bars)
-    bars["rvol"] = compute_rvol(bars, 20)
-    cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
-    if cands is None or cands.empty:
-        st.error("No candidates available for breadth run.")
+    if bars is None or bars.empty:
+        st.error("No bars for breadth run.")
     else:
-        # ensure numeric 'signal' and 'pred_prob'
-        cands["pred_prob"] = cands.get("pred_prob", 0.0)
-        if "signal" not in cands.columns:
-            cands["signal"] = (cands["pred_prob"] * 10).round().astype(int)
-        try:
+        bars["rvol"] = compute_rvol(bars, 20)
+        cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+        if cands is None or cands.empty:
+            st.warning("No candidates generated with default lookback. Trying fallback lookback=10...")
+            cands = generate_candidates_and_labels(bars, lookback=10, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+            st.write("DEBUG: after fallback, candidates count:", 0 if cands is None else len(cands))
+        if cands is None or cands.empty:
+            st.error("Still no candidates available for breadth run.")
+        else:
+            cands["pred_prob"] = cands.get("pred_prob", 0.0)
             res = run_breadth_backtest(clean=cands, bars=bars, levels_config=levels, feature_cols=feat_cols_default, model_train_kwargs={"max_bars": 60})
             summary_df = pd.DataFrame(res.get("summary", []))
             st.subheader("Breadth Summary")
@@ -799,51 +844,47 @@ if run_breadth:
             for lvl, df in detailed.items():
                 st.subheader(f"{lvl} — {len(df)} trades")
                 st.dataframe(df.head(50))
-            st.write("Diagnostics:")
-            st.write(res.get("diagnostics", []))
-        except Exception as exc:
-            logger.exception("Breadth backtest failed: %s", exc)
-            st.error(f"Breadth backtest failed: {exc}")
+            if res.get("diagnostics"):
+                st.write("Diagnostics:")
+                for d in res["diagnostics"]:
+                    st.write("-", d)
 
 # Grid sweep handler
 if run_sweep_btn:
     st.info("Running grid sweep (RR x SL x MPT)...")
     bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
     bars = ensure_unique_index(bars)
-    bars["rvol"] = compute_rvol(bars, 20)
-    cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
-    if cands is None or cands.empty:
-        st.error("No candidates for sweep.")
+    if bars is None or bars.empty:
+        st.error("No bars for sweep.")
     else:
-        rr_vals = [lvl1_rr_min, lvl1_rr_max, lvl2_rr_min, lvl2_rr_max, lvl3_rr_min, lvl3_rr_max]
-        rr_vals = sorted(list(set([float(round(x, 2)) for x in rr_vals if x is not None])))
-        sl_ranges = [(float(lvl1_sl_min), float(lvl1_sl_max)), (float(lvl2_sl_min), float(lvl2_sl_max)), (float(lvl3_sl_min), float(lvl3_sl_max))]
-        mpt_list = [float(p_fast), float(p_slow), float(p_deep)]
-        # ensure signal/pred_prob exists
-        cands["pred_prob"] = cands.get("pred_prob", 0.0)
-        if "signal" not in cands.columns:
-            cands["signal"] = (cands["pred_prob"] * 10).round().astype(int)
-        try:
-            sweep_results = run_grid_sweep(clean=cands, bars=bars, rr_vals=rr_vals, sl_ranges=sl_ranges, mpt_list=mpt_list, feature_cols=feat_cols_default, model_train_kwargs={"max_bars":60})
-            # summarize best runs
-            summary_rows = []
-            for k, v in sweep_results.items():
-                if isinstance(v, dict) and "overlay" in v and isinstance(v["overlay"], pd.DataFrame) and not v["overlay"].empty:
-                    s = summarize_trades(v["overlay"])
-                    if not s.empty:
-                        r = s.iloc[0].to_dict()
-                        r.update({"config": k, "trades_count": v.get("trades_count", 0)})
-                        summary_rows.append(r)
-            if summary_rows:
-                sdf = pd.DataFrame(summary_rows).sort_values("total_pnl", ascending=False).reset_index(drop=True)
-                st.subheader("Sweep summary (top configs)")
-                st.dataframe(sdf.head(20))
-                st.download_button("Download sweep summary CSV", df_to_csv_bytes(sdf), "sweep_summary.csv", "text/csv")
-            else:
-                st.warning("Sweep returned no runs with trades.")
-        except Exception as exc:
-            logger.exception("Sweep failed: %s", exc)
-            st.error(f"Sweep failed: {exc}")
+        bars["rvol"] = compute_rvol(bars, 20)
+        cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+        if cands is None or cands.empty:
+            st.warning("No candidates for sweep.")
+        else:
+            rr_vals = sorted(list(set([L1["rr_min"], L1["rr_max"], L2["rr_min"], L2["rr_max"], L3["rr_min"], L3["rr_max"]])))
+            sl_ranges = [(L1["sl_min"], L1["sl_max"]), (L2["sl_min"], L2["sl_max"]), (L3["sl_min"], L3["sl_max"])]
+            mpt_list = [float(p_fast), float(p_slow), float(p_deep)]
+            try:
+                sweep_results = run_grid_sweep(clean=cands, bars=bars, rr_vals=rr_vals, sl_ranges=sl_ranges, mpt_list=mpt_list, feature_cols=feat_cols_default, model_train_kwargs={"max_bars":60})
+                summary_rows = []
+                for k, v in sweep_results.items():
+                    if isinstance(v, dict) and "overlay" in v and v["overlay"] is not None and not v["overlay"].empty:
+                        s = summarize_trades(v["overlay"])
+                        if not s.empty:
+                            r = s.iloc[0].to_dict()
+                            r.update({"config": k, "trades_count": v.get("trades_count", 0)})
+                            summary_rows.append(r)
+                if summary_rows:
+                    sdf = pd.DataFrame(summary_rows).sort_values("total_pnl", ascending=False).reset_index(drop=True)
+                    st.subheader("Sweep summary (top configs)")
+                    st.dataframe(sdf.head(20))
+                    st.download_button("Download sweep summary CSV", df_to_csv_bytes(sdf), "sweep_summary.csv", "text/csv")
+                else:
+                    st.warning("Sweep returned no runs with trades.")
+            except Exception as exc:
+                logger.exception("Sweep failed: %s", exc)
+                st.error(f"Sweep failed: {exc}")
 
-# Help text
-st.sidebar.markdown("### Notes\n- Level thresholds now produce explicit non-overlapping buy/sell windows per level.\n- L3 is the narrowest/highest-confidence scope; L1 is the widest/scope level.\n- Use the Breadth run to simulate trades per level and ensure exclusivity.")
+# Sidebar help
+st.sidebar.markdown("### Notes\n- Levels have explicit buy_min/buy_max and sell_min/sell_max. Keep ranges exclusive to avoid ambiguity.\n- Breadth uses level-specific RR/SL ranges to simulate trades.\n- Use fallback lookback when data is short or intraday.")
