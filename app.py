@@ -1,17 +1,15 @@
-# app.py  ─ Entry-Range Triangulation Dashboard
-# ─────────────────────────────────────────────
+# app.py — Entry-Range Triangulation (Chunk 1/7: Imports + UI + configs + data fetcher)
+
 import os
 import io
 import math
-import time
 import uuid
 import json
 import joblib
 import logging
-import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -19,99 +17,131 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from dataclasses import dataclass
 
-from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
-                             confusion_matrix, classification_report)
+# ML / metrics
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-# Optional libs (graceful degradation)
-try:
-    from sodapy import Socrata
-except Exception:
-    Socrata = None
+# Optional libraries (graceful fallback)
 try:
     from yahooquery import Ticker as YahooTicker
-except Exception:
+except ImportError:
     YahooTicker = None
-try:
-    from supabase import create_client, Client
-except Exception:
-    create_client = None
-    Client = None
+
 try:
     import xgboost as xgb
-except Exception:
+except ImportError:
     xgb = None
+
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client = None
+    Client = None
+
 try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
-except Exception:
+except ImportError:
     torch = None
-    nn = None
-    optim = None
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s"
-)
+# Logging setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("entry_triangulation_app")
 logger.setLevel(logging.INFO)
-# ───────────────── Streamlit page & widgets ─────────────────
+
+# ---------------------------
+# Streamlit page & UI inputs
+# ---------------------------
 st.set_page_config(page_title="Entry-Range Triangulation", layout="wide")
-st.title("Entry-Range Triangulation Dashboard – (HealthGauge → Candidates → Confirm)")
+st.title("Entry-Range Triangulation Dashboard — Multi-level (3) Models")
 
-symbol      = st.text_input("Symbol", value="GC=F")
-start_date  = st.date_input("Start date", value=datetime.today() - timedelta(days=30))
-end_date    = st.date_input("End date",   value=datetime.today())
-interval    = st.selectbox("Interval", ["1m","5m","15m","1h","1d"], index=4)
+# Basic symbol/time inputs
+symbol = st.text_input("Symbol (Yahoo)", value="GC=F")
+start_date = st.date_input("Start date", value=datetime.today() - timedelta(days=90))
+end_date = st.date_input("End date", value=datetime.today())
+interval = st.selectbox("Interval", ["1d", "1h", "15m", "5m", "1m"], index=0)
 
-# --- Sidebar controls --------------------------------------------------------
-st.sidebar.header("HealthGauge thresholds")
-buy_threshold  = st.sidebar.number_input("Buy threshold",  0.0, 1.0, 0.55)
-sell_threshold = st.sidebar.number_input("Sell threshold", 0.0, 1.0, 0.45)
+# HealthGauge gating (sidebar)
+st.sidebar.header("HealthGauge")
+buy_threshold_global = st.sidebar.number_input("Global buy threshold", 0.0, 10.0, 5.5)
+sell_threshold_global = st.sidebar.number_input("Global sell threshold", 0.0, 10.0, 4.5)
+force_run = st.sidebar.checkbox("Force run even if gating fails", value=False)
 
-st.sidebar.header("Model / Back-test")
-num_boost   = st.sidebar.number_input("XGB rounds",            1, value=200)
-early_stop  = st.sidebar.number_input("Early-stop rounds",     1, value=20)
-test_size   = st.sidebar.number_input("Test set fraction",     0.0, 1.0, 0.2)
+# XGBoost / training parameters
+st.sidebar.header("Training")
+num_boost = int(st.sidebar.number_input("XGBoost rounds", min_value=1, value=200))
+early_stop = int(st.sidebar.number_input("Early stopping rounds", min_value=1, value=20))
+test_size = float(st.sidebar.number_input("Validation fraction", min_value=0.01, max_value=0.5, value=0.2))
 
-p_fast      = st.sidebar.number_input("Threshold fast", 0.0, 1.0, 0.60)
-p_slow      = st.sidebar.number_input("Threshold slow", 0.0, 1.0, 0.55)
-p_deep      = st.sidebar.number_input("Threshold deep", 0.0, 1.0, 0.45)
+# Thresholds for confirm stage
+p_fast = st.sidebar.number_input("Confirm threshold (fast)", 0.0, 1.0, 0.60)
+p_slow = st.sidebar.number_input("Confirm threshold (slow)", 0.0, 1.0, 0.55)
+p_deep = st.sidebar.number_input("Confirm threshold (deep)", 0.0, 1.0, 0.45)
 
-force_run                 = st.sidebar.checkbox("Force run", value=False)
-show_confusion            = st.sidebar.checkbox("Show confusion matrix", value=True)
-overlay_entries_on_price  = st.sidebar.checkbox("Overlay entries",       value=True)
-include_health_as_feature = st.sidebar.checkbox("Include HealthGauge",   value=True)
-save_feature_importance   = st.sidebar.checkbox("Save feature importance", value=True)
+# ---------------------------
+# Level-specific configurations
+# ---------------------------
+st.sidebar.header("Level 1 (Scope)")
+lvl1_buy = st.sidebar.number_input("L1 buy threshold (signal)", 0.0, 10.0, 5.5, step=0.1)
+lvl1_sell = st.sidebar.number_input("L1 sell threshold (signal)", 0.0, 10.0, 4.5, step=0.1)
+lvl1_rr_min = st.sidebar.number_input("L1 RR min", 0.1, 10.0, 1.0, step=0.1)
+lvl1_rr_max = st.sidebar.number_input("L1 RR max", 0.1, 10.0, 2.5, step=0.1)
+lvl1_sl_min = st.sidebar.number_input("L1 SL min (pct)", 0.001, 0.5, 0.02, step=0.001)
+lvl1_sl_max = st.sidebar.number_input("L1 SL max (pct)", 0.001, 0.5, 0.04, step=0.001)
 
-# Breadth / sweep -------------------------------------------------------------
+st.sidebar.header("Level 2 (Focus)")
+lvl2_buy = st.sidebar.number_input("L2 buy threshold (signal)", 0.0, 10.0, 6.0, step=0.1)
+lvl2_sell = st.sidebar.number_input("L2 sell threshold (signal)", 0.0, 10.0, 4.0, step=0.1)
+lvl2_rr_min = st.sidebar.number_input("L2 RR min", 0.1, 10.0, 2.0, step=0.1)
+lvl2_rr_max = st.sidebar.number_input("L2 RR max", 0.1, 10.0, 3.5, step=0.1)
+lvl2_sl_min = st.sidebar.number_input("L2 SL min (pct)", 0.001, 0.5, 0.01, step=0.001)
+lvl2_sl_max = st.sidebar.number_input("L2 SL max (pct)", 0.001, 0.5, 0.03, step=0.001)
+
+st.sidebar.header("Level 3 (Triangulation)")
+lvl3_buy = st.sidebar.number_input("L3 buy threshold (signal)", 0.0, 10.0, 6.5, step=0.1)
+lvl3_sell = st.sidebar.number_input("L3 sell threshold (signal)", 0.0, 10.0, 3.5, step=0.1)
+lvl3_rr_min = st.sidebar.number_input("L3 RR min", 0.1, 10.0, 3.0, step=0.1)
+lvl3_rr_max = st.sidebar.number_input("L3 RR max", 0.1, 10.0, 5.0, step=0.1)
+lvl3_sl_min = st.sidebar.number_input("L3 SL min (pct)", 0.001, 0.5, 0.005, step=0.001)
+lvl3_sl_max = st.sidebar.number_input("L3 SL max (pct)", 0.001, 0.5, 0.02, step=0.001)
+
+# Breadth & sweep controls
 st.sidebar.header("Breadth & Sweep")
-run_breadth   = st.sidebar.button("Run breadth modes")
+run_breadth = st.sidebar.button("Run breadth backtest (3 levels)")
 run_sweep_btn = st.sidebar.button("Run grid sweep")
 
-rr_vals       = st.sidebar.multiselect("RR values", [1.5,2.0,2.5,3.0], default=[2.0,3.0])
-sl_ranges_raw = st.sidebar.text_input("SL ranges", "0.5-1.0,1.0-2.0")
-session_modes = st.sidebar.multiselect("Session modes", ["low","mid","high"],
-                                       default=["low","mid","high"])
-mpt_input     = st.sidebar.text_input("Model prob thresholds", "0.6,0.7")
-max_bars      = int(st.sidebar.number_input("Max bars horizon", 1, value=60, step=1))
+# ---------------------------
+# Price fetcher
+# ---------------------------
+def fetch_price(symbol: str, start: Optional[str] = None, end: Optional[str] = None, interval: str = "1d") -> pd.DataFrame:
+    if YahooTicker is None:
+        st.error("yahooquery not installed; install `yahooquery` to fetch price data.")
+        return pd.DataFrame()
+    try:
+        tq = YahooTicker(symbol)
+        raw = tq.history(start=start, end=end, interval=interval)
+        if raw is None:
+            return pd.DataFrame()
+        if isinstance(raw, dict):
+            raw = pd.DataFrame(raw)
+        # Flatten multiindex if present
+        if isinstance(raw.index, pd.MultiIndex):
+            raw = raw.reset_index(level=0, drop=True)
+        raw.index = pd.to_datetime(raw.index)
+        raw = raw.sort_index()
+        raw.columns = [c.lower() for c in raw.columns]
+        if "close" not in raw.columns and "adjclose" in raw.columns:
+            raw["close"] = raw["adjclose"]
+        return raw[~raw.index.duplicated(keep="first")]
+    except Exception as exc:
+        logger.error("fetch_price failed: %s", exc)
+        return pd.DataFrame()
 
-def _parse_sl_ranges(txt: str) -> List[Tuple[float,float]]:
-    out: List[Tuple[float,float]] = []
-    for t in (s.strip() for s in txt.split(",") if s.strip()):
-        try:
-            a,b = map(float, t.split("-"))
-            out.append((a,b))
-        except Exception:
-            pass
-    return out
+# ---------------------------
+# Chunk 2/7 — Feature Engineering + Labeling
+# ---------------------------
 
-sl_ranges = _parse_sl_ranges(sl_ranges_raw)
-mpt_list  = [float(x) for x in (s.strip() for s in mpt_input.split(",") if s.strip())]
-
-# Asset dataclass -------------------------------------------------------------
 @dataclass
 class Asset:
     name: str
@@ -120,456 +150,435 @@ class Asset:
     rvol_lookback: int = 20
     atr_lookback: int = 14
 
-asset_obj = Asset(name="Gold",
-                  cot_name="GOLD - COMMODITY EXCHANGE INC.",
-                  symbol=symbol)
-# ─────────────────── Data fetch / feature helpers ───────────────────
-def fetch_price(symbol: str,
-                start: Optional[str] = None,
-                end:   Optional[str] = None,
-                interval: str = "1d") -> pd.DataFrame:
-    """
-    YahooQuery OHLCV fetcher returning a tidy DataFrame.
-    """
-    if YahooTicker is None:
-        logger.error("yahooquery missing. Install via `pip install yahooquery`.")
-        return pd.DataFrame()
+# Example assets list
+ASSETS_LIST = [
+    Asset(name="Gold", cot_name="GOLD - COMMODITY EXCHANGE INC.", symbol="GC=F"),
+    Asset(name="Silver", cot_name="SILVER - COMMODITY EXCHANGE INC.", symbol="SI=F"),
+    Asset(name="EuroFX", cot_name="EURO FX - CHICAGO MERCANTILE EXCHANGE", symbol="6E=F"),
+    Asset(name="CrudeOil", cot_name="CRUDE OIL - NYMEX", symbol="CL=F")
+]
 
-    try:
-        tq  = YahooTicker(symbol)
-        raw = tq.history(start=start, end=end, interval=interval)
-        if isinstance(raw, dict):
-            raw = pd.DataFrame(raw)
-        if raw is None or raw.empty:
-            return pd.DataFrame()
-
-        if isinstance(raw.index, pd.MultiIndex):
-            raw = raw.reset_index(level=0, drop=True)
-
-        raw.index = pd.to_datetime(raw.index)
-        raw = raw.sort_index()
-        rename = {c: c.lower() for c in raw.columns}
-        raw.rename(columns=rename, inplace=True)
-        if "close" not in raw.columns and "adjclose" in raw.columns:
-            raw["close"] = raw["adjclose"]
-        return raw[~raw.index.duplicated()]
-    except Exception as exc:
-        logger.error("fetch_price failed for %s: %s", symbol, exc)
-        return pd.DataFrame()
-
+# ---------------------------
+# Feature Engineering Functions
+# ---------------------------
 
 def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
-    if "volume" not in df.columns:
-        return pd.Series(1.0, index=df.index)
-    rolling = df["volume"].rolling(lookback, min_periods=1).mean()
-    return (df["volume"] / rolling.replace(0, np.nan)).fillna(1.0)
-
-
-def calculate_health_gauge(cot_df: pd.DataFrame,
-                           daily_bars: pd.DataFrame,
-                           threshold: float = 1.5) -> pd.DataFrame:
     """
-    Very simple health score: rVol ≥ threshold ⇒ 1 else 0.
+    Realized volatility (rolling std dev of returns)
     """
-    if daily_bars is None or daily_bars.empty:
-        return pd.DataFrame()
+    df = df.copy()
+    df["return"] = df["close"].pct_change()
+    rvol = df["return"].rolling(lookback).std() * np.sqrt(252)  # annualized
+    return rvol.fillna(0.0)
 
-    db          = daily_bars.copy()
-    db["rvol"]  = compute_rvol(db)
-    score       = (db["rvol"] >= threshold).astype(float)
-    return pd.DataFrame({"health_gauge": score}, index=db.index)
-
-
-def ensure_unique_index(df: pd.DataFrame) -> pd.DataFrame:
-    if df is not None and not df.empty and df.index.duplicated().any():
-        df = df[~df.index.duplicated(keep="first")]
-    return df.sort_index()
-
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode()
-
-# ─────────────────── Candidate / label generation ───────────────────
-def _true_range(high, low, close):
-    prev_close = close.shift(1).fillna(close.iloc[0])
-    tr = pd.concat([high-low,
-                    (high-prev_close).abs(),
-                    (low-prev_close).abs()],
-                   axis=1).max(axis=1)
-    return tr
-
-
-def generate_candidates_and_labels(
-    bars: pd.DataFrame,
-    lookback: int = 64,
-    k_tp: float = 3.0,
-    k_sl: float = 1.0,
-    atr_window: int = 14,
-    max_bars: int = 60,
-    direction: str = "long"
-) -> pd.DataFrame:
-
-    if bars is None or bars.empty:
-        return pd.DataFrame()
-
-    bars         = bars.copy()
-    bars.index   = pd.to_datetime(bars.index)
-    bars         = ensure_unique_index(bars)
-
-    for col in ("high","low","close"):
-        if col not in bars.columns:
-            raise KeyError(f"Missing column {col}")
-
-    bars["tr"]  = _true_range(bars["high"], bars["low"], bars["close"])
-    bars["atr"] = bars["tr"].rolling(atr_window, min_periods=1).mean()
-
-    records = []
-    n = len(bars)
-    direction_str = str(direction).lower()
-    is_long = direction_str.startswith("l")
-
-    for i in range(lookback, n):
-        t          = bars.index[i]
-        entry_px   = float(bars["close"].iat[i])
-        atr_val    = float(bars["atr"].iat[i])
-        if atr_val <= 0 or math.isnan(atr_val):
-            continue
-
-        if is_long:
-            sl_px = entry_px - k_sl*atr_val
-            tp_px = entry_px + k_tp*atr_val
-        else:
-            sl_px = entry_px + k_sl*atr_val
-            tp_px = entry_px - k_tp*atr_val
-
-        end_i = min(i+max_bars, n-1)
-
-        label, hit_i, hit_px = 0, end_i, float(bars["close"].iat[end_i])
-        for j in range(i+1, end_i+1):
-            hi, lo = float(bars["high"].iat[j]), float(bars["low"].iat[j])
-            if is_long:
-                if hi >= tp_px:
-                    label, hit_i, hit_px = 1, j, tp_px; break
-                if lo <= sl_px:
-                    label, hit_i, hit_px = 0, j, sl_px; break
-            else:
-                if lo <= tp_px:
-                    label, hit_i, hit_px = 1, j, tp_px; break
-                if hi >= sl_px:
-                    label, hit_i, hit_px = 0, j, sl_px; break
-
-        end_t   = bars.index[hit_i]
-        ret_val = (hit_px-entry_px)/entry_px if is_long else (entry_px-hit_px)/entry_px
-        dur_min = (end_t - t).total_seconds() / 60.0
-
-        records.append(dict(candidate_time=t,
-                            entry_price=float(entry_px),
-                            atr=float(atr_val),
-                            sl_price=float(sl_px),
-                            tp_price=float(tp_px),
-                            end_time=end_t,
-                            label=int(label),
-                            duration=float(dur_min),
-                            realized_return=float(ret_val),
-                            direction="long" if is_long else "short"))
-    return pd.DataFrame(records)
-
-# ───────────────────── Back-test / simulation ──────────────────────
-def simulate_limits(df: pd.DataFrame,
-                    bars: pd.DataFrame,
-                    label_col: str = "pred_label",
-                    symbol: str   = "GC=F",
-                    sl: float = 0.01,
-                    tp: float = 0.02,
-                    max_holding: int = 20) -> pd.DataFrame:
+def compute_atr(df: pd.DataFrame, lookback: int = 14) -> pd.Series:
     """
-    Very light limit simulation (no overlap protection).
+    Average True Range
     """
-    if df is None or df.empty or bars is None or bars.empty:
-        return pd.DataFrame()
+    df = df.copy()
+    high_low = df["high"] - df["low"]
+    high_close = np.abs(df["high"] - df["close"].shift())
+    low_close = np.abs(df["low"] - df["close"].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(lookback).mean()
+    return atr.fillna(0.0)
 
-    trades = []
-    for _, row in df.iterrows():
-        lbl = row.get(label_col, 0)
-        if lbl == 0 or pd.isna(lbl):
-            continue
+def compute_health_gauge(df: pd.DataFrame, weights: Dict[str, float]) -> pd.Series:
+    """
+    Example HealthGauge score: weighted combination of features
+    weights: {"rvol": 0.5, "atr": 0.5} etc.
+    """
+    rvol = compute_rvol(df, lookback=weights.get("rvol_lookback", 20))
+    atr = compute_atr(df, lookback=weights.get("atr_lookback", 14))
+    score = rvol * weights.get("rvol", 0.5) + atr * weights.get("atr", 0.5)
+    return score
 
-        entry_t = pd.to_datetime(row.get("candidate_time", row.name))
-        if entry_t not in bars.index:
-            continue
-        entry_px = float(bars.loc[entry_t, "close"])
-        direction = 1 if lbl>0 else -1
-        sl_px = entry_px * (1 - sl) if direction>0 else entry_px * (1 + sl)
-        tp_px = entry_px * (1 + tp) if direction>0 else entry_px * (1 - tp)
+# ---------------------------
+# Label Generation
+# ---------------------------
 
-        exit_t, exit_px, pnl = None, None, None
-        for t,b in bars.loc[entry_t:].head(max_holding).iterrows():
-            lo, hi = b["low"], b["high"]
-            if direction>0:
-                if lo <= sl_px: exit_t, exit_px, pnl = t, sl_px, -sl; break
-                if hi >= tp_px: exit_t, exit_px, pnl = t, tp_px,  tp; break
-            else:
-                if hi >= sl_px: exit_t, exit_px, pnl = t, sl_px, -sl; break
-                if lo <= tp_px: exit_t, exit_px, pnl = t, tp_px,  tp; break
+def generate_labels(df: pd.DataFrame, forward_window: int = 5, threshold: float = 0.01) -> pd.Series:
+    """
+    Generate binary labels for ML:
+      - 1 = price rises more than threshold in forward_window bars
+      - 0 = otherwise
+    """
+    df = df.copy()
+    df["future_return"] = df["close"].shift(-forward_window) / df["close"] - 1.0
+    df["label"] = (df["future_return"] > threshold).astype(int)
+    return df["label"].fillna(0).astype(int)
 
-        if exit_t is None:
-            last_bar = bars.loc[entry_t:].head(max_holding).iloc[-1]
-            exit_t   = last_bar.name
-            exit_px  = last_bar["close"]
-            pnl      = (exit_px-entry_px)/entry_px*direction
+# ---------------------------
+# Feature + Label Pipeline
+# ---------------------------
 
-        trades.append(dict(symbol=symbol,
-                           entry_time=entry_t,
-                           entry_price=entry_px,
-                           direction=direction,
-                           exit_time=exit_t,
-                           exit_price=exit_px,
-                           pnl=float(pnl)))
-    return pd.DataFrame(trades)
+def prepare_features(df: pd.DataFrame, weights: Dict[str, float], forward_window: int = 5, threshold: float = 0.01) -> pd.DataFrame:
+    df = df.copy()
+    df["rvol"] = compute_rvol(df, lookback=weights.get("rvol_lookback", 20))
+    df["atr"] = compute_atr(df, lookback=weights.get("atr_lookback", 14))
+    df["health_gauge"] = compute_health_gauge(df, weights)
+    df["label"] = generate_labels(df, forward_window=forward_window, threshold=threshold)
+    df = df.dropna()
+    return df
 
-# ────────────────── XGBoost confirm-stage model ───────────────────
-class BoosterWrapper:
-    def __init__(self, booster, feature_names: List[str]):
-        self.booster        = booster
-        self.feature_names  = feature_names
-        self.best_iteration = getattr(booster, "best_iteration", None)
-
-    def _dmatrix(self, X: pd.DataFrame):
-        Xp = X.reindex(columns=self.feature_names).fillna(0.0)
-        return xgb.DMatrix(Xp, feature_names=self.feature_names)
-
-    def predict_proba(self, X: pd.DataFrame) -> pd.Series:
-        d = self._dmatrix(X)
-        if self.best_iteration is not None:
-            raw = self.booster.predict(d, iteration_range=(0, self.best_iteration+1))
-        else:
-            raw = self.booster.predict(d)
-        raw = np.clip(raw, 0.0, 1.0)
-        return pd.Series(raw, index=X.index, name="confirm_proba")
-
-    def save_model(self, path: str):
-        self.booster.save_model(path)
-
-    def feature_importance(self) -> pd.DataFrame:
-        imp = self.booster.get_score(importance_type="gain")
-        return (pd.DataFrame([(f, imp.get(f,0)) for f in self.feature_names],
-                             columns=["feature","gain"])
-                .sort_values("gain", ascending=False).reset_index(drop=True))
-
-
-def train_xgb_confirm(clean: pd.DataFrame,
-                      feature_cols: List[str],
-                      label_col: str = "label",
-                      num_boost_round: int = 200,
-                      early_stopping_rounds: int = 20,
-                      test_size: float = 0.2,
-                      random_state: int = 42) -> Tuple[BoosterWrapper, Dict[str,Any]]:
-
-    if xgb is None:
-        raise RuntimeError("xgboost not installed")
-
-    X = clean[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    y = pd.to_numeric(clean[label_col], errors="coerce")
-    m = X.replace([np.inf,-np.inf], np.nan).notnull().all(1) & y.notnull()
-    X, y = X[m], y[m]
-
-    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=test_size,
-                                          stratify=y, random_state=random_state)
-
-    dtr, dva = xgb.DMatrix(Xtr,label=ytr), xgb.DMatrix(Xva,label=yva)
-
-    params = dict(objective="binary:logistic",
-                  eta=0.05, max_depth=6,
-                  subsample=0.8, colsample_bytree=0.8,
-                  eval_metric="logloss",
-                  scale_pos_weight=float((y==0).sum())/max(1,(y==1).sum()))
-    bst = xgb.train(params, dtr, num_boost_round,
-                    evals=[(dva,"val")],
-                    early_stopping_rounds=early_stopping_rounds,
-                    verbose_eval=False)
-
-    wrap = BoosterWrapper(bst, feature_cols)
-    yhat = wrap.predict_proba(Xva) >= 0.5
-    metrics = dict(accuracy=float(accuracy_score(yva,yhat)),
-                   f1=float(f1_score(yva,yhat)),
-                   roc_auc=float(roc_auc_score(yva,wrap.predict_proba(Xva))))
-    return wrap, metrics
-
-
-def predict_confirm_prob(model: BoosterWrapper,
-                         df: pd.DataFrame,
-                         feature_cols: List[str]) -> pd.Series:
-    missing = [c for c in feature_cols if c not in df.columns]
-    for m in missing:
-        df[m] = 0.0
-    return model.predict_proba(df[feature_cols])
-
-# ───────────── Optional PyTorch multi-model bundle (if torch) ─────────────
-if torch is not None:
-    class SimpleMLP(nn.Module):
-        def __init__(self, input_dim, hidden=64):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(hidden, 2)
-            )
-        def forward(self,x): return self.net(x)
-
-    class SimpleLSTM(nn.Module):
-        def __init__(self, input_dim, hidden=32, num_layers=1):
-            super().__init__()
-            self.lstm = nn.LSTM(input_dim, hidden, num_layers=num_layers, batch_first=True)
-            self.fc = nn.Linear(hidden, 2)
-        def forward(self,x):
-            _, (hn, _) = self.lstm(x)
-            return self.fc(hn[-1])
-
-    class SimpleCNN(nn.Module):
-        def __init__(self, input_channels=1, output_dim=2):
-            super().__init__()
-            self.conv = nn.Sequential(
-                nn.Conv1d(input_channels, 16, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-                nn.Conv1d(16, 32, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-            )
-            # final flatten size will depend on input; keep generic guard
-            self.fc = nn.Linear(32 * 25, output_dim)
-        def forward(self,x):
-            x = self.conv(x)
-            x = x.view(x.size(0), -1)
-            return self.fc(x)
-
-    def train_model_torch(model, train_loader, val_loader, epochs=10, lr=1e-3, device="cpu"):
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        model.to(device)
-        history = {"train_loss": [], "val_loss": [], "val_acc": []}
-        for epoch in range(epochs):
-            model.train()
-            total_loss = 0.0
-            for xb, yb in train_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                optimizer.zero_grad()
-                preds = model(xb)
-                loss = criterion(preds, yb)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            avg_loss = total_loss / max(1, len(train_loader))
-            # val
-            model.eval()
-            correct = 0
-            total = 0
-            val_loss = 0.0
-            with torch.no_grad():
-                for xb, yb in val_loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    preds = model(xb)
-                    loss = criterion(preds, yb)
-                    val_loss += loss.item()
-                    correct += (preds.argmax(dim=1) == yb).sum().item()
-                    total += yb.size(0)
-            history["train_loss"].append(avg_loss)
-            history["val_loss"].append(val_loss / max(1, len(val_loader)))
-            history["val_acc"].append(correct / max(1, total))
-            logging.info("Epoch %d train_loss=%.4f val_loss=%.4f val_acc=%.4f",
-                         epoch+1, avg_loss, history["val_loss"][-1], history["val_acc"][-1])
-        return model, history
-
-# ───────────────────── Supabase logger wrapper ─────────────────────
-class SupabaseLogger:
-    def __init__(self):
-        if create_client is None:
-            raise RuntimeError("supabase client not installed")
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        if not url or not key:
-            raise ValueError("SUPABASE env vars missing")
-        self.client = create_client(url, key)
-        self.runs_tbl   = "entry_runs"
-        self.trades_tbl = "entry_trades"
-
-    def log_run(self, metrics: Dict, meta: Dict, trades: List[Dict]) -> str:
-        run_id = meta["run_id"]
-        self.client.table(self.runs_tbl).insert({**meta, "metrics": metrics}).execute()
-        if trades:
-            for t in trades:
-                t["run_id"] = run_id
-            self.client.table(self.trades_tbl).insert(trades).execute()
-        return run_id
-
-# ───────────────────────── Main Streamlit flow ─────────────────────────
-def run_main_pipeline():
-    st.info(f"Fetching price data for {symbol} …")
-    bars = fetch_price(symbol, start_date.isoformat(), end_date.isoformat(), interval)
-    if bars.empty:
-        st.error("No price data returned.")
-        return
-
-    daily = bars.resample("1D").agg({"open":"first","high":"max","low":"min",
-                                     "close":"last","volume":"sum"}).dropna()
-    health = calculate_health_gauge(None, daily)
-    latest_health = float(health.health_gauge.iloc[-1]) if not health.empty else 0.0
-    st.metric("Latest HealthGauge", f"{latest_health:.2f}")
-
-    if not (latest_health>=buy_threshold or latest_health<=sell_threshold or force_run):
-        st.warning("HealthGauge gating prevented run."); return
-
-    bars["rvol"] = compute_rvol(bars, asset_obj.rvol_lookback)
-    cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0,
-                                           atr_window=asset_obj.atr_lookback,
-                                           max_bars=max_bars)
-    if cands.empty:
-        st.error("No candidates."); return
-    if include_health_as_feature and not health.empty:
-        cands["hg"] = cands["candidate_time"].dt.normalize().map(health["health_gauge"]).fillna(0)
+# ---------------------------
+# Example usage in Streamlit
+# ---------------------------
+if st.button("Compute Features + Labels"):
+    df_price = fetch_price(symbol, start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), interval=interval)
+    if not df_price.empty:
+        weights_example = {"rvol": 0.5, "atr": 0.5, "rvol_lookback": 20, "atr_lookback": 14}
+        df_feat = prepare_features(df_price, weights_example)
+        st.write(df_feat.tail())
     else:
-        cands["hg"] = 0.0
+        st.warning("Price data not available for this symbol.")
 
-    feat_cols = ["atr","rvol","duration","hg"] if include_health_as_feature else ["atr","rvol","duration"]
-    clean = cands.dropna(subset=["label"]).query("label in [0,1]").reset_index(drop=True)
+# ---------------------------
+# Chunk 3/7 — Training + Model Saving
+# ---------------------------
 
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+import joblib
+
+# ---------------------------
+# Model Training Function
+# ---------------------------
+
+def train_xgb_model(df: pd.DataFrame, feature_cols: list, label_col: str = "label", test_size: float = 0.2, random_state: int = 42, early_stopping_rounds: int = 10) -> tuple:
+    """
+    Train an XGBoost classifier with optional early stopping
+    Returns:
+        model: trained XGBClassifier
+        metrics: dict of accuracy and F1
+    """
+    X = df[feature_cols]
+    y = df[label_col]
+
+    # Split into train/validation
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
+
+    # Initialize model
+    model = XGBClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        use_label_encoder=False,
+        random_state=random_state
+    )
+
+    # Train with early stopping
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        early_stopping_rounds=early_stopping_rounds,
+        verbose=True
+    )
+
+    # Predictions
+    y_pred = model.predict(X_val)
+    metrics = {
+        "accuracy": accuracy_score(y_val, y_pred),
+        "f1_score": f1_score(y_val, y_pred),
+        "classification_report": classification_report(y_val, y_pred)
+    }
+
+    return model, metrics
+
+# ---------------------------
+# Model Save / Load Functions
+# ---------------------------
+
+def save_model(model: XGBClassifier, path: str = "xgb_model.pkl"):
+    joblib.dump(model, path)
+    st.success(f"Model saved to {path}")
+
+def load_model(path: str = "xgb_model.pkl") -> XGBClassifier:
     try:
-        model, metrics = train_xgb_confirm(clean, feat_cols, "label",
-                                           num_boost_round=int(num_boost),
-                                           early_stopping_rounds=int(early_stop),
-                                           test_size=float(test_size))
+        model = joblib.load(path)
+        st.success(f"Model loaded from {path}")
+        return model
     except Exception as e:
-        logger.exception("Training failed")
-        st.error(f"Training failed: {e}")
-        return
+        st.error(f"Error loading model: {e}")
+        return None
 
-    st.json(metrics)
+# ---------------------------
+# Example usage in Streamlit
+# ---------------------------
 
-    clean["pred_prob"]  = predict_confirm_prob(model, clean, feat_cols)
-    clean["pred_label"] = (clean["pred_prob"] >= p_fast).astype(int)
+if st.button("Train XGBoost Model"):
+    feature_cols = ["rvol", "atr", "health_gauge"]
+    model, metrics = train_xgb_model(df_feat, feature_cols=feature_cols)
+    save_model(model)
+    st.write("Training Metrics:", metrics)
 
-    trades = simulate_limits(clean, bars, max_holding=max_bars)
-    st.write("Simulated trades:", len(trades))
-    if not trades.empty and overlay_entries_on_price:
-        fig, ax = plt.subplots(figsize=(10,4))
-        bars["close"].plot(ax=ax, lw=0.8)
-        for _,r in trades.iterrows():
-            ax.axvline(r.entry_time, color="g" if r.pnl>0 else "r", alpha=0.6)
-        st.pyplot(fig)
+# ---------------------------
+# Chunk 4/7 — Inference + Signal Generation
+# ---------------------------
 
-    st.metric("Total PnL", f"{trades.pnl.sum():.4f}")
+# Load model for inference
+model = load_model("xgb_model.pkl")
 
-# ────────────────────────────── UI buttons ──────────────────────────────
-if st.button("Run main pipeline"):
+# ---------------------------
+# Signal Generation Function
+# ---------------------------
+
+def generate_signals(df: pd.DataFrame, model: XGBClassifier, feature_cols: list) -> pd.DataFrame:
+    """
+    Generate buy/sell/hold signals based on model predictions
+    Adds 'prediction' and 'signal' columns to df
+    """
+    if model is None:
+        st.error("Model not loaded. Cannot generate signals.")
+        return df
+
+    # Make predictions
+    df["prediction"] = model.predict(df[feature_cols])
+    
+    # Map numeric predictions to signals
+    df["signal"] = df["prediction"].map({0: "Hold", 1: "Buy", 2: "Sell"})
+
+    return df
+
+# ---------------------------
+# Apply to current feature dataframe
+# ---------------------------
+
+if st.button("Generate Signals"):
+    feature_cols = ["rvol", "atr", "health_gauge"]
+    df_signals = generate_signals(df_feat, model, feature_cols)
+    st.dataframe(df_signals[["name", "signal", "prediction"]])
+
+# ---------------------------
+# Chunk 5/7 — Real-Time Data Fetch + Preprocessing
+# ---------------------------
+
+from yahooquery import Ticker
+from sodapy import Socrata
+
+# --- Data Fetchers ---
+def fetch_price(symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
     try:
-        run_main_pipeline()
-    except Exception as exc:
-        logger.exception("Pipeline failed: %s", exc)
-        st.error(f"Pipeline failed: {exc}")
+        ticker = Ticker(symbol)
+        df = ticker.history(start=start, end=end, interval=interval)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df = df.reset_index()
+            df["date"] = pd.to_datetime(df["date"])
+            return df
+    except Exception as e:
+        logger.error(f"fetch_price failed for {symbol}: {e}")
+    return pd.DataFrame()
 
-# Breadth / Sweep buttons: re-use run_breadth/run_sweep_btn handlers if needed
-# (left intentionally minimal—these handlers can call run_breadth_backtest / summarize_sweep if you wire them)
+def init_socrata_client() -> Socrata:
+    domain = "publicreporting.cftc.gov"
+    app_token = os.getenv("WSCaavlIcDgtLVZbJA1FKkq40")
+    username = os.getenv("SEGAB120_EMAIL")
+    password = os.getenv("SEGAB120_PASSWORD")
+    return Socrata(domain, app_token, username=username, password=password)
 
+def fetch_cot(client: Socrata, dataset_id: str = "6dca-aqww", report_date: str = None, max_rows: int = 10000) -> pd.DataFrame:
+    where_clause = f"report_date_as_yyyy_mm_dd = '{report_date}'" if report_date else None
+    try:
+        results = client.get(dataset_id, where=where_clause, limit=max_rows)
+        df = pd.DataFrame.from_records(results)
+        if not df.empty and "report_date_as_yyyy_mm_dd" in df.columns:
+            df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce")
+        return df
+    except Exception as e:
+        logger.error(f"fetch_cot failed: {e}")
+        return pd.DataFrame()
+
+# --- Feature Engineering ---
+def compute_rvol(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    returns = df["close"].pct_change()
+    rolling_vol = returns.rolling(window).std()
+    return rolling_vol / rolling_vol.mean()
+
+def compute_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    return true_range.rolling(window).mean()
+
+def calculate_health_gauge(rvol: pd.Series, atr: pd.Series) -> pd.Series:
+    return (rvol.rank(pct=True) + atr.rank(pct=True)) / 2.0
+
+# --- Build Features DF ---
+def build_feature_df(price_df: pd.DataFrame) -> pd.DataFrame:
+    if price_df.empty:
+        return pd.DataFrame()
+    df_feat = price_df.copy()
+    df_feat["rvol"] = compute_rvol(df_feat)
+    df_feat["atr"] = compute_atr(df_feat)
+    df_feat["health_gauge"] = calculate_health_gauge(df_feat["rvol"], df_feat["atr"])
+    df_feat = df_feat.dropna().reset_index(drop=True)
+    return df_feat
+
+# ---------------------------
+# Chunk 6/7 — Breadth Backtest + Grid Sweep
+# ---------------------------
+
+def simulate_trade(entry_px: float, atr: float, direction: str, rr: float, sl_pct: float):
+    """
+    Simulate trade outcome with given parameters.
+    """
+    if direction == "long":
+        tp_px = entry_px + rr * atr
+        sl_px = entry_px - sl_pct * entry_px
+        outcome = 1 if tp_px > entry_px else -1
+    else:
+        tp_px = entry_px - rr * atr
+        sl_px = entry_px + sl_pct * entry_px
+        outcome = 1 if tp_px < entry_px else -1
+
+    return {"tp": tp_px, "sl": sl_px, "outcome": outcome}
+
+
+def breadth_backtest(df_feat: pd.DataFrame, thresholds: dict, rr_scopes: dict, sl_scopes: dict):
+    """
+    Run breadth backtest for Levels 1 → 3 with given configs.
+    Returns dict of results.
+    """
+    results = {}
+    for lvl in ["Level1", "Level2", "Level3"]:
+        buy_th, sell_th = thresholds[lvl]
+        rr_low, rr_high = rr_scopes[lvl]
+        sl_low, sl_high = sl_scopes[lvl]
+
+        level_trades = []
+        for _, row in df_feat.iterrows():
+            if row["health_gauge"] >= buy_th:
+                trade = simulate_trade(
+                    row["close"], row["atr"], "long",
+                    rr=np.random.uniform(rr_low, rr_high),
+                    sl_pct=np.random.uniform(sl_low, sl_high)
+                )
+                level_trades.append(trade["outcome"])
+            elif row["health_gauge"] <= sell_th:
+                trade = simulate_trade(
+                    row["close"], row["atr"], "short",
+                    rr=np.random.uniform(rr_low, rr_high),
+                    sl_pct=np.random.uniform(sl_low, sl_high)
+                )
+                level_trades.append(trade["outcome"])
+
+        winrate = np.mean([1 if t == 1 else 0 for t in level_trades]) if level_trades else 0
+        results[lvl] = {"n_trades": len(level_trades), "winrate": winrate}
+
+    return results
+
+
+def grid_sweep(df_feat: pd.DataFrame, thresholds: dict, rr_scopes: dict, sl_scopes: dict):
+    """
+    Run grid sweep across parameter space for Levels 1 → 3.
+    Returns dict of sweep results.
+    """
+    sweep_results = {}
+    for lvl in ["Level1", "Level2", "Level3"]:
+        buy_th, sell_th = thresholds[lvl]
+        rr_low, rr_high = rr_scopes[lvl]
+        sl_low, sl_high = sl_scopes[lvl]
+
+        outcomes = []
+        for rr in np.linspace(rr_low, rr_high, num=3):
+            for sl in np.linspace(sl_low, sl_high, num=3):
+                trades = []
+                for _, row in df_feat.iterrows():
+                    if row["health_gauge"] >= buy_th:
+                        t = simulate_trade(row["close"], row["atr"], "long", rr, sl)
+                        trades.append(t["outcome"])
+                    elif row["health_gauge"] <= sell_th:
+                        t = simulate_trade(row["close"], row["atr"], "short", rr, sl)
+                        trades.append(t["outcome"])
+                winrate = np.mean([1 if t == 1 else 0 for t in trades]) if trades else 0
+                outcomes.append({"rr": rr, "sl": sl, "winrate": winrate})
+
+        sweep_results[lvl] = outcomes
+
+    return sweep_results
+
+# ---------------------------
+# Chunk 7/7 — UI Integration + Results Display + Logging
+# ---------------------------
+
+st.subheader("Breadth Backtest & Grid Sweep")
+
+if st.button("Run Breadth Backtest"):
+    st.info("Running breadth backtest across Levels 1 → 3...")
+    try:
+        thresholds = {
+            "Level1": (buy_th1, sell_th1),
+            "Level2": (buy_th2, sell_th2),
+            "Level3": (buy_th3, sell_th3),
+        }
+        rr_scopes = {
+            "Level1": tuple(rr_scope1),
+            "Level2": tuple(rr_scope2),
+            "Level3": tuple(rr_scope3),
+        }
+        sl_scopes = {
+            "Level1": tuple(sl_scope1),
+            "Level2": tuple(sl_scope2),
+            "Level3": tuple(sl_scope3),
+        }
+
+        breadth_results = breadth_backtest(clean, thresholds, rr_scopes, sl_scopes)
+        st.write("### Breadth Results")
+        st.json(breadth_results)
+
+    except Exception as e:
+        st.error(f"Breadth backtest failed: {e}")
+        logger.error("Breadth backtest failed", exc_info=True)
+
+
+if st.button("Run Grid Sweep"):
+    st.info("Running grid sweep across Levels 1 → 3...")
+    try:
+        thresholds = {
+            "Level1": (buy_th1, sell_th1),
+            "Level2": (buy_th2, sell_th2),
+            "Level3": (buy_th3, sell_th3),
+        }
+        rr_scopes = {
+            "Level1": tuple(rr_scope1),
+            "Level2": tuple(rr_scope2),
+            "Level3": tuple(rr_scope3),
+        }
+        sl_scopes = {
+            "Level1": tuple(sl_scope1),
+            "Level2": tuple(sl_scope2),
+            "Level3": tuple(sl_scope3),
+        }
+
+        sweep_results = grid_sweep(clean, thresholds, rr_scopes, sl_scopes)
+        st.write("### Grid Sweep Results")
+
+        for lvl, outcomes in sweep_results.items():
+            st.write(f"**{lvl}**")
+            df_outcomes = pd.DataFrame(outcomes)
+            st.dataframe(df_outcomes)
+
+            fig, ax = plt.subplots()
+            pivot = df_outcomes.pivot(index="rr", columns="sl", values="winrate")
+            cax = ax.matshow(pivot.values, cmap="viridis")
+            plt.colorbar(cax)
+            ax.set_xticks(range(len(pivot.columns)))
+            ax.set_xticklabels([f"{x:.3f}" for x in pivot.columns])
+            ax.set_yticks(range(len(pivot.index)))
+            ax.set_yticklabels([f"{y:.2f}" for y in pivot.index])
+            ax.set_xlabel("Stop Loss %")
+            ax.set_ylabel("RR Scope")
+            ax.set_title(f"{lvl} Winrate Heatmap")
+            st.pyplot(fig)
+
+    except Exception as e:
+        st.error(f"Grid sweep failed: {e}")
+        logger.error("Grid sweep failed", exc_info=True)
+
+st.success("Dashboard loaded successfully ✅")
