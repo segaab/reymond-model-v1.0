@@ -1,6 +1,3 @@
-# app.py — Entry-Range Triangulation (integrated single-file)
-# Chunk 1/8: imports + Streamlit UI + level configs + data fetcher
-
 import os
 import io
 import math
@@ -14,16 +11,18 @@ import pickle
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any, Optional
+from collections import deque
+from dataclasses import dataclass, asdict
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from dataclasses import dataclass
 
 # ML / metrics
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler  # This was missing
 
 # Optional libs (graceful degradation)
 try:
@@ -60,7 +59,7 @@ logger.setLevel(logging.INFO)
 # Streamlit page & UI inputs
 # ---------------------------
 st.set_page_config(page_title="Entry-Range Triangulation", layout="wide")
-st.title("Entry-Range Triangulation Dashboard — Multi-level (3) Models")
+st.title("Entry-Range Triangulation Dashboard -- Multi-level (3) Models")
 
 # Basic symbol/time inputs
 symbol = st.text_input("Symbol (Yahoo)", value="GC=F")
@@ -148,8 +147,6 @@ def fetch_price(symbol: str, start: Optional[str] = None, end: Optional[str] = N
         logger.error("fetch_price failed: %s", exc)
         return pd.DataFrame()
 
-# Chunk 2/8: features + labeling
-
 def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
     if "volume" not in df.columns:
         return pd.Series(1.0, index=df.index)
@@ -233,9 +230,6 @@ def generate_candidates_and_labels(bars: pd.DataFrame,
             "direction": direction
         })
     return pd.DataFrame(recs)
-
-# Chunk 3/8: backtest + summarization
-
 def simulate_limits(df: pd.DataFrame,
                     bars: pd.DataFrame,
                     label_col: str = "pred_label",
@@ -330,7 +324,6 @@ def combine_summaries(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
 
-# Chunk 4/8: model training (xgboost), prediction and export helpers
 
 class BoosterWrapper:
     def __init__(self, booster, feature_names: List[str]):
@@ -527,8 +520,6 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
             paths["pt_verification_error"] = verification_error
 
     return paths
-
-# Chunk 5/8: CascadeTrader and models (from your cascade_trader.py content)
 
 # Config dataclasses for the cascade
 @dataclass
@@ -770,7 +761,6 @@ class TemperatureScaler(nn.Module):
             scaled = self.forward(logits_t).cpu().numpy()
         return scaled
 
-# Chunk 6/8: Training helpers, L2 fallback MLP, and CascadeTrader wrapper
 
 def _device(name: str) -> torch.device:
     if name == "auto":
@@ -1147,7 +1137,6 @@ class CascadeTrader:
         })
         return out
 
-# Chunk 7/8: breadth/sweep, supabase logger, helpers, session state init
 
 def run_breadth_backtest(clean: pd.DataFrame,
                          bars: pd.DataFrame,
@@ -1303,165 +1292,6 @@ if "bars" not in st.session_state: st.session_state.bars = pd.DataFrame()
 if "cands" not in st.session_state: st.session_state.cands = pd.DataFrame()
 if "trader" not in st.session_state: st.session_state.trader = None
 if "export_paths" not in st.session_state: st.session_state.export_paths = {}
-
-# Chunk 7/8: breadth/sweep, supabase logger, helpers, session state init
-
-def run_breadth_backtest(clean: pd.DataFrame,
-                         bars: pd.DataFrame,
-                         levels_config: Dict[str, Dict[str, Any]],
-                         feature_cols: List[str],
-                         model_train_kwargs: Dict[str,Any]) -> Dict[str, Any]:
-    out = {"summary": [], "detailed_trades": {}, "diagnostics": []}
-    if clean is None or clean.empty:
-        out["diagnostics"].append("No candidate set provided.")
-        return out
-    # enforce exclusivity: we'll compute explicit scopes and ensure they don't overlap
-    # Expect levels_config to have min/max for buy and sell (buy_min, buy_max, sell_min, sell_max)
-    for lvl_name, cfg in levels_config.items():
-        try:
-            buy_th = cfg.get("buy_th")
-            sell_th = cfg.get("sell_th")
-            rr_min = cfg.get("rr_min")
-            rr_max = cfg.get("rr_max")
-            sl_min = cfg.get("sl_min")
-            sl_max = cfg.get("sl_max")
-
-            df = clean.copy()
-            if "signal" not in df.columns:
-                if "pred_prob" in df.columns:
-                    df["signal"] = (df["pred_prob"] * 10).round().astype(int)
-                else:
-                    df["signal"] = 0
-
-            # enforce exclusivity by requiring signal within a min/max band (if provided)
-            # here buy_th/sell_th are single values; treat them as central thresholds with default ±0.5 margin to create a band
-            band_margin = cfg.get("band_margin", 0.5)
-            buy_min = cfg.get("buy_min", buy_th - band_margin)
-            buy_max = cfg.get("buy_max", buy_th + band_margin)
-            sell_min = cfg.get("sell_min", sell_th - band_margin)
-            sell_max = cfg.get("sell_max", sell_th + band_margin)
-
-            df["pred_label"] = 0
-            # label long only if signal within buy_min..buy_max
-            df.loc[(df["signal"] >= buy_min) & (df["signal"] <= buy_max), "pred_label"] = 1
-            # label short only if signal within  sell_min..sell_max
-            df.loc[(df["signal"] >= sell_min) & (df["signal"] <= sell_max) & (df["pred_label"] == 0), "pred_label"] = -1
-
-            sl_pct = float((sl_min + sl_max) / 2.0)
-            rr = float((rr_min + rr_max) / 2.0)
-            tp_pct = rr * sl_pct
-
-            trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
-            out["detailed_trades"][lvl_name] = trades
-            summary = summarize_trades(trades)
-            if not summary.empty:
-                summary["mode"] = lvl_name
-                out["summary"].append(summary.iloc[0].to_dict())
-            out["diagnostics"].append(f"{lvl_name}: simulated {len(trades)} trades, sl={sl_pct:.4f}, tp={tp_pct:.4f}")
-        except Exception as exc:
-            logger.exception("Breadth level %s failed: %s", lvl_name, exc)
-            out["diagnostics"].append(f"{lvl_name} error: {exc}")
-    out["summary"] = out["summary"] or []
-    return out
-
-def run_grid_sweep(clean: pd.DataFrame,
-                   bars: pd.DataFrame,
-                   rr_vals: List[float],
-                   sl_ranges: List[Tuple[float,float]],
-                   mpt_list: List[float],
-                   feature_cols: List[str],
-                   model_train_kwargs: Dict[str,Any]) -> Dict[str, Any]:
-    results = {}
-    if clean is None or clean.empty:
-        return results
-    for rr in rr_vals:
-        for sl_min, sl_max in sl_ranges:
-            sl_pct = (sl_min + sl_max) / 2.0
-            tp_pct = rr * sl_pct
-            for mpt in mpt_list:
-                key = f"rr{rr:.2f}_sl{sl_min:.3f}-{sl_max:.3f}_mpt{mpt:.2f}"
-                try:
-                    df = clean.copy()
-                    if "pred_prob" not in df.columns:
-                        if "signal" in df.columns:
-                            df["pred_prob"] = (df["signal"] / 10.0).clip(0.0, 1.0)
-                        else:
-                            df["pred_prob"] = 0.0
-                    df["pred_label"] = (df["pred_prob"] >= mpt).astype(int)
-                    trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
-                    results[key] = {"trades_count": len(trades), "overlay": trades}
-                except Exception as exc:
-                    logger.exception("Sweep config %s failed: %s", key, exc)
-                    results[key] = {"error": str(exc)}
-    return results
-
-# Supabase logger
-class SupabaseLogger:
-    def __init__(self):
-        if create_client is None:
-            raise RuntimeError("supabase client not installed")
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        if not url or not key:
-            raise ValueError("SUPABASE env vars missing")
-        self.client = create_client(url, key)
-        self.runs_tbl = "entry_runs"
-        self.trades_tbl = "entry_trades"
-
-    def log_run(self, metrics: Dict, metadata: Dict, trades: Optional[List[Dict]] = None) -> str:
-        run_id = metadata.get("run_id") or str(uuid.uuid4())
-        metadata["run_id"] = run_id
-        payload = {**metadata, "metrics": metrics}
-        resp = self.client.table(self.runs_tbl).insert(payload).execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Failed to insert run: {resp.error}")
-        if trades:
-            for t in trades:
-                t["run_id"] = run_id
-            tr_resp = self.client.table(self.trades_tbl).insert(trades).execute()
-            if getattr(tr_resp, "error", None):
-                raise RuntimeError(f"Failed to insert trades: {tr_resp.error}")
-        return run_id
-
-    def fetch_runs(self, symbol: Optional[str] = None, limit: int = 50):
-        q = self.client.table(self.runs_tbl)
-        if symbol:
-            q = q.eq("symbol", symbol)
-        resp = q.order("start_date", desc=True).limit(limit).execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Failed to fetch runs: {resp.error}")
-        return getattr(resp, "data", [])
-
-    def fetch_trades(self, run_id: str):
-        resp = self.client.table(self.trades_tbl).select("*").eq("run_id", run_id).execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Failed to fetch trades: {resp.error}")
-        return getattr(resp, "data", [])
-
-# Helpers
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode()
-
-def pick_top_runs_by_metrics(runs: List[Dict], top_n: int = 3):
-    scored = []
-    for r in runs:
-        metrics = r.get("metrics") if isinstance(r, dict) else r
-        total_pnl = metrics.get("total_pnl", 0.0) if metrics else 0.0
-        win_rate = metrics.get("win_rate", 0.0) if metrics else 0.0
-        score = float(total_pnl) + float(win_rate) * 0.01
-        scored.append((score, r))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [item[1] for item in scored[:top_n]]
-
-# session state containers
-if "bars" not in st.session_state: st.session_state.bars = pd.DataFrame()
-if "cands" not in st.session_state: st.session_state.cands = pd.DataFrame()
-if "trader" not in st.session_state: st.session_state.trader = None
-if "export_paths" not in st.session_state: st.session_state.export_paths = {}
-
-# Chunk 8/8: Streamlit actions including the one-button run_full_pipeline (your replacement chunk)
 
 def fetch_and_prepare():
     st.info(f"Fetching {symbol} {interval} from YahooQuery …")
