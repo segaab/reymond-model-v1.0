@@ -1,4 +1,4 @@
-# app.py — Entry-Range Triangulation: Cascade Trader Streamlit (Chunk 1/7)
+# app.py — Cascade Trader Streamlit (Chunk 1/7)
 import os
 import io
 import math
@@ -11,20 +11,17 @@ import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
 from dataclasses import dataclass, asdict
 
-# ML libs
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-# Optional libs (graceful degradation)
+# Optional libs
 try:
     from yahooquery import Ticker as YahooTicker
 except Exception:
@@ -49,9 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("cascade_trader_app")
 logger.setLevel(logging.INFO)
 
-# ---------------------------
 # Streamlit UI
-# ---------------------------
 st.set_page_config(page_title="Cascade Trader — Scope→Aim→Shoot", layout="wide")
 st.title("Cascade Trader — Scope → Aim → Shoot (L1/L2/L3)")
 
@@ -76,9 +71,6 @@ p_slow = st.sidebar.number_input("Confirm threshold (slow)", 0.0, 1.0, 0.55)
 p_deep = st.sidebar.number_input("Confirm threshold (deep)", 0.0, 1.0, 0.45)
 
 st.sidebar.markdown("### Level gating (exclusive ranges) — signal scale 0..10")
-st.sidebar.markdown("Define explicit buy/sell ranges per level. Ranges should be exclusive (L3 inside L2 inside L1).")
-
-# Level ranges - we enforce exclusivity in logic later
 lvl1_buy_min = st.sidebar.number_input("L1 buy min", 0.0, 10.0, 5.50, step=0.01)
 lvl1_buy_max = st.sidebar.number_input("L1 buy max", 0.0, 10.0, 9.90, step=0.01)
 lvl1_sell_min = st.sidebar.number_input("L1 sell min", 0.0, 10.0, 0.00, step=0.01)
@@ -101,10 +93,9 @@ run_sweep_btn = st.sidebar.button("Run grid sweep (light)")
 autofocus = st.sidebar.checkbox("Enable autofocus tuning", value=True)
 threads_training = int(st.sidebar.number_input("Training threads (L2/L3 concurrency)", min_value=1, max_value=8, value=2))
 
-st.sidebar.markdown("### Export")
+st.sidebar.header("Export")
 save_pt = st.sidebar.checkbox("Save .pt bundles", value=True)
 
-# Fetcher (YahooQuery)
 def fetch_price(symbol: str, start: Optional[str]=None, end: Optional[str]=None, interval: str="1d") -> pd.DataFrame:
     if YahooTicker is None:
         logger.error("yahooquery missing. Install via `pip install yahooquery`.")
@@ -129,6 +120,34 @@ def fetch_price(symbol: str, start: Optional[str]=None, end: Optional[str]=None,
         return pd.DataFrame()
 
 # Chunk 2/7: features + health gauge + candidate generator
+def compute_engineered_features(df: pd.DataFrame, windows=(5,10,20)) -> pd.DataFrame:
+    f = pd.DataFrame(index=df.index)
+    c = df['close'].astype(float)
+    h = df['high'].astype(float)
+    l = df['low'].astype(float)
+    o = df['open'].astype(float)
+    v = df['volume'].astype(float)
+
+    ret1 = c.pct_change().fillna(0.0)
+    f['ret1'] = ret1
+    f['logret1'] = np.log1p(ret1.replace(-1, -0.999999))
+    tr = (h - l).clip(lower=0)
+    f['tr'] = tr
+    for w in windows:
+        f[f'rmean_{w}'] = c.pct_change(w).fillna(0.0)
+        f[f'vol_{w}'] = ret1.rolling(w).std().fillna(0.0)
+        f[f'tr_mean_{w}'] = tr.rolling(w).mean().fillna(0.0)
+        f[f'vol_z_{w}'] = (v.rolling(w).mean() - v.rolling(w*3).mean()).fillna(0.0)
+        f[f'mom_{w}'] = (c - c.rolling(w).mean()).fillna(0.0)
+        f[f'kurt_{w}'] = ret1.rolling(w).kurt().fillna(0.0).replace([np.inf,-np.inf],0.0)
+        f[f'skew_{w}'] = ret1.rolling(w).skew().fillna(0.0)
+        roll_max = c.rolling(w).max().fillna(method='bfill')
+        roll_min = c.rolling(w).min().fillna(method='bfill')
+        denom = (roll_max - roll_min).replace(0, np.nan)
+        f[f'chanpos_{w}'] = ((c - roll_min) / denom).fillna(0.5)
+    f = f.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    return f
+
 def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
     if "volume" not in df.columns:
         return pd.Series(1.0, index=df.index)
@@ -150,8 +169,7 @@ def ensure_unique_index(df: pd.DataFrame) -> pd.DataFrame:
         df = df[~df.index.duplicated(keep="first")]
     return df.sort_index()
 
-# true range
-def _true_range(high, low, close):
+def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1).fillna(close.iloc[0])
     tr = pd.concat([high-low, (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
     return tr
@@ -163,9 +181,6 @@ def generate_candidates_and_labels(bars: pd.DataFrame,
                                    atr_window: int = 14,
                                    max_bars: int = 60,
                                    direction: str = "long") -> pd.DataFrame:
-    """
-    Triple-barrier style candidate generation similar to your earlier code.
-    """
     if bars is None or bars.empty:
         return pd.DataFrame()
     bars = bars.copy()
@@ -176,7 +191,7 @@ def generate_candidates_and_labels(bars: pd.DataFrame,
             raise KeyError(f"Missing column {col}")
     bars["tr"] = _true_range(bars["high"], bars["low"], bars["close"])
     bars["atr"] = bars["tr"].rolling(atr_window, min_periods=1).mean()
-    records = []
+    recs = []
     n = len(bars)
     for i in range(lookback, n):
         t = bars.index[i]
@@ -184,38 +199,35 @@ def generate_candidates_and_labels(bars: pd.DataFrame,
         atr = float(bars["atr"].iat[i])
         if atr <= 0 or math.isnan(atr):
             continue
-        sl_px = entry_px - k_sl*atr if direction=="long" else entry_px + k_sl*atr
-        tp_px = entry_px + k_tp*atr if direction=="long" else entry_px - k_tp*atr
-        end_i = min(i+max_bars, n-1)
-        label, hit_i, hit_px = 0, end_i, float(bars["close"].iat[end_i])
-        for j in range(i+1, end_i+1):
-            hi, lo = float(bars["high"].iat[j]), float(bars["low"].iat[j])
-            if direction=="long":
-                if hi >= tp_px:
-                    label, hit_i, hit_px = 1, j, tp_px; break
-                if lo <= sl_px:
-                    label, hit_i, hit_px = 0, j, sl_px; break
-            else:
-                if lo <= tp_px:
-                    label, hit_i, hit_px = 1, j, tp_px; break
-                if hi >= sl_px:
-                    label, hit_i, hit_px = 0, j, sl_px; break
-        end_t = bars.index[hit_i]
-        ret_val = (hit_px-entry_px)/entry_px if direction=="long" else (entry_px-hit_px)/entry_px
+        sl_px = entry_px - k_sl * atr if direction == "long" else entry_px + k_sl * atr
+        tp_px = entry_px + k_tp * atr if direction == "long' else entry_px - k_tp * atr" if False else entry_px + k_tp * atr
+        # (we consistently use long pipeline here)
+        end_idx = min(i + max_bars, n - 1)
+        label = 0; hit_idx = end_idx; hit_px = float(bars["close"].iat[end_idx])
+        for j in range(i+1, end_idx+1):
+            hi = float(bars["high"].iat[j]); lo = float(bars["low"].iat[j])
+            if hi >= tp_px:
+                label, hit_idx, hit_px = 1, j, tp_px; break
+            if lo <= sl_px:
+                label, hit_idx, hit_px = 0, j, sl_px; break
+        end_t = bars.index[hit_idx]
+        realized_return = (hit_px - entry_px) / entry_px
         dur_min = (end_t - t).total_seconds() / 60.0
-        records.append(dict(candidate_time=t,
-                            entry_price=float(entry_px),
-                            atr=float(atr),
-                            sl_price=float(sl_px),
-                            tp_price=float(tp_px),
-                            end_time=end_t,
-                            label=int(label),
-                            duration=float(dur_min),
-                            realized_return=float(ret_val),
-                            direction=direction))
-    return pd.DataFrame(records)
+        recs.append({
+            "candidate_time": t,
+            "entry_price": float(entry_px),
+            "atr": float(atr),
+            "sl_price": float(sl_px),
+            "tp_price": float(tp_px),
+            "end_time": end_t,
+            "label": int(label),
+            "duration": float(dur_min),
+            "realized_return": float(realized_return),
+            "direction": "long"
+        })
+    return pd.DataFrame(recs)
 
-# Chunk 3/7: backtest + summarization + sweep helpers
+# Chunk 3/7: simulate and summarize trades + sweep
 def simulate_limits(df: pd.DataFrame,
                     bars: pd.DataFrame,
                     label_col: str = "pred_label",
@@ -259,13 +271,15 @@ def simulate_limits(df: pd.DataFrame,
             exit_t = last_bar.name
             exit_px = float(last_bar["close"])
             pnl = (exit_px-entry_px)/entry_px * direction
-        trades.append(dict(symbol=symbol,
-                           entry_time=entry_t,
-                           entry_price=entry_px,
-                           direction=direction,
-                           exit_time=exit_t,
-                           exit_price=exit_px,
-                           pnl=float(pnl)))
+        trades.append({
+            "symbol": symbol,
+            "entry_time": entry_t,
+            "entry_price": entry_px,
+            "direction": direction,
+            "exit_time": exit_t,
+            "exit_price": exit_px,
+            "pnl": float(pnl)
+        })
     return pd.DataFrame(trades)
 
 def summarize_trades(trades: pd.DataFrame) -> pd.DataFrame:
@@ -321,9 +335,10 @@ def run_grid_sweep(clean: pd.DataFrame,
                     results[key] = {"error": str(exc)}
     return results
 
-
-# Chunk 4/7: models, training helpers, temperature scaler, cascade wrapper
+# Chunk 4/7: models, datasets, training helpers
 if torch is not None:
+    from torch.utils.data import Dataset, DataLoader
+
     class ConvBlock(nn.Module):
         def __init__(self, c_in, c_out, k, d, pdrop):
             super().__init__()
@@ -412,16 +427,13 @@ if torch is not None:
                 scaled = self.forward(logits_t).cpu().numpy()
             return scaled
 
-    # Training helpers (small, robust)
-    from torch.utils.data import Dataset, DataLoader
-
     class SequenceDataset(Dataset):
         def __init__(self, X_seq: np.ndarray, y: np.ndarray):
             self.X = X_seq.astype(np.float32)
             self.y = y.astype(np.float32).reshape(-1,1)
         def __len__(self): return len(self.X)
         def __getitem__(self, idx):
-            x = self.X[idx].transpose(1,0)  # [F,T]
+            x = self.X[idx].transpose(1,0)
             return x, self.y[idx]
 
     class TabDataset(Dataset):
@@ -486,8 +498,7 @@ if torch is not None:
         if best_state is not None:
             model.load_state_dict(best_state)
         return model, {"best_val_loss": best_loss, "history": history}
-
-# We will implement a small CascadeTrainer wrapper with the essential fit/predict/export hooks
+# Chunk 5/7: SimpleCascade class (fit, inference helpers)
 class SimpleCascade:
     def __init__(self, device="auto"):
         self.device = _device(device) if torch is not None else None
@@ -503,8 +514,8 @@ class SimpleCascade:
         self._fitted = False
         self.metadata = {}
 
-# Chunk 5/7: Cascade fitting, inference, autofocus, parallel L2/L3 training
-if torch is not None:
+    # helper: build sequence windows
+    @staticmethod
     def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.ndarray:
         X = []
         for t in indices:
@@ -517,32 +528,41 @@ if torch is not None:
             X.append(seq)
         return np.stack(X, axis=0)
 
-    def _l1_infer_logits_emb_batch(model, Xseq, device):
+    def _l1_infer_logits_emb_batch(self, model, Xseq, device):
         model.eval()
         logits, embeds = [], []
         with torch.no_grad():
             for i in range(0, len(Xseq), 1024):
                 chunk = Xseq[i:i+1024]
-                xb = torch.tensor(chunk.transpose(0,2,1), dtype=torch.float32, device=device)  # [B,F,T] -> model expects [B,F,T]
-                logit, emb = model(xb)
+                xb = torch.tensor(chunk.transpose(0,2,1), dtype=torch.float32, device=device)
+                out = model(xb)
+                logit = out[0] if isinstance(out, tuple) else out
+                emb = out[1] if isinstance(out, tuple) else None
                 logits.append(logit.detach().cpu().numpy())
                 embeds.append(emb.detach().cpu().numpy())
         logits = np.concatenate(logits, axis=0).reshape(-1,1)
         embeds = np.concatenate(embeds, axis=0)
         return logits, embeds
 
-    # Integrate into SimpleCascade as methods
-    def cascade_fit(self, df: pd.DataFrame, events: pd.DataFrame, l1_seq_len: int = 64,
-                    xgb_rounds: int = 200, early_stop_rounds: int = 20,
-                    val_size: float = 0.2, device: str = "auto", threads: int = 2):
-        """
-        Fit L1 (CNN), then L2 (XGB or MLP), then L3 (MLP). L2 and L3 are trained in parallel threads.
-        events: DataFrame with columns 't' (index positions into df) and 'y' {0,1}
-        """
+    def _l3_infer_logits(self, model, X, device):
+        model.eval()
+        logits = []
+        with torch.no_grad():
+            for i in range(0, len(X), 2048):
+                xb = torch.tensor(X[i:i+2048], dtype=torch.float32, device=device)
+                out = model(xb)
+                logit = out[0] if isinstance(out, tuple) else out
+                logits.append(logit.detach().cpu().numpy())
+        return np.concatenate(logits, axis=0).reshape(-1,1)
+
+    def fit(self, df: pd.DataFrame, events: pd.DataFrame, l1_seq_len: int = 64,
+            xgb_rounds: int = 200, early_stop_rounds: int = 20,
+            val_size: float = 0.2, device: str = "auto", threads: int = 2):
+        if torch is None:
+            raise RuntimeError("Torch required for cascade training")
         t0 = time.time()
-        logger.info("Starting cascade_fit")
-        # 1) engineered features (reuse compute_engineered_features pattern)
-        eng = compute_engineered_features_for_cascade(df)
+        logger.info("Starting cascade.fit")
+        eng = compute_engineered_features(df)
         seq_cols = ['open','high','low','close','volume']
         micro_cols = [c for c in eng.columns if c.startswith(("ret1","tr","vol_","mom_","chanpos_"))]
         use_cols = [c for c in seq_cols + micro_cols if c in df.columns.union(eng.columns)]
@@ -552,12 +572,10 @@ if torch is not None:
         idx = events['t'].astype(int).values
         y = events['y'].astype(int).values
 
-        # train/val split (time-aware would be better; quick stratified version here)
         train_idx, val_idx = train_test_split(np.arange(len(idx)), test_size=val_size, random_state=42, stratify=y)
         idx_train, idx_val = idx[train_idx], idx[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
 
-        # scaleers — fit on full train slices
         X_seq_all = feat_seq_df.values
         self.scaler_seq.fit(X_seq_all)
         X_seq_all_scaled = self.scaler_seq.transform(X_seq_all)
@@ -567,42 +585,33 @@ if torch is not None:
         self.scaler_tab.fit(X_tab_all)
         X_tab_all_scaled = self.scaler_tab.transform(X_tab_all)
 
-        # Build L1 datasets
-        Xseq_train = to_sequences(X_seq_all_scaled, idx_train, seq_len=l1_seq_len)
-        Xseq_val = to_sequences(X_seq_all_scaled, idx_val, seq_len=l1_seq_len)
+        Xseq_train = self.to_sequences(X_seq_all_scaled, idx_train, seq_len=l1_seq_len)
+        Xseq_val = self.to_sequences(X_seq_all_scaled, idx_val, seq_len=l1_seq_len)
         ds_l1_train = SequenceDataset(Xseq_train, y_train); ds_l1_train.batch_size = 128
         ds_l1_val = SequenceDataset(Xseq_val, y_val)
 
-        # Instantiate L1
         in_features = Xseq_train.shape[2]
         self.l1 = Level1ScopeCNN(in_features=in_features)
         self.l1_temp = TemperatureScaler()
+        self.l1, l1_hist = train_torch_classifier(self.l1, ds_l1_train, ds_l1_val, lr=1e-3, epochs=20, patience=5, pos_weight=1.0, device=device)
 
-        self.l1, l1_hist = train_torch_classifier(
-            self.l1, ds_l1_train, ds_l1_val,
-            lr=1e-3, epochs=20, patience=5, pos_weight=1.0, device=device)
-
-        # L1 embeddings for L2/L3
-        l1_train_logits, l1_train_emb = _l1_infer_logits_emb_batch(self.l1, Xseq_train, self.device)
-        l1_val_logits, l1_val_emb = _l1_infer_logits_emb_batch(self.l1, Xseq_val, self.device)
-        # temperature scaling
+        l1_train_logits, l1_train_emb = self._l1_infer_logits_emb_batch(self.l1, Xseq_train, self.device)
+        l1_val_logits, l1_val_emb = self._l1_infer_logits_emb_batch(self.l1, Xseq_val, self.device)
         try:
             self.l1_temp.fit(l1_val_logits, y_val)
         except Exception as e:
             logger.warning("L1 temp fit failed: %s", e)
 
-        # Build tabular inputs for L2/L3
         Xtab_train = X_tab_all_scaled[idx_train]
         Xtab_val = X_tab_all_scaled[idx_val]
         X_l2_train = np.hstack([l1_train_emb, Xtab_train])
         X_l2_val = np.hstack([l1_val_emb, Xtab_val])
 
-        # Train L2 & L3 in parallel (XGBoost or MLP)
-        results = {}
+        # Train L2 & L3 in parallel
         def train_l2():
             try:
                 if XGBOOST_AVAILABLE:
-                    clf = xgb.XGBClassifier(n_estimators=xgb_rounds if (xgb_rounds:=200) else 200, max_depth=5, use_label_encoder=False, eval_metric="logloss")
+                    clf = xgb.XGBClassifier(n_estimators=int(xgb_rounds), max_depth=5, use_label_encoder=False, eval_metric="logloss")
                     clf.fit(X_l2_train, y_train, eval_set=[(X_l2_val, y_val)], verbose=False)
                     return ("xgb", clf, {})
                 else:
@@ -625,28 +634,21 @@ if torch is not None:
                 return ("error", None, {"error": str(e)})
 
         with ThreadPoolExecutor(max_workers=max(1,threads)) as ex:
-            futs = {"l2": ex.submit(train_l2), "l3": ex.submit(train_l3)}
-            for name, fut in futs.items():
-                try:
-                    res = fut.result()
-                    results[name] = res
-                except Exception as e:
-                    results[name] = ("error", None, {"error": str(e)})
-        # Unpack
-        l2_kind, l2_model, l2_meta = results.get("l2", ("error", None, {}))
-        l3_kind, l3_model, l3_meta = results.get("l3", ("error", None, {}))
+            fut_l2 = ex.submit(train_l2)
+            fut_l3 = ex.submit(train_l3)
+            l2_kind, l2_model, l2_meta = fut_l2.result()
+            l3_kind, l3_model, l3_meta = fut_l3.result()
+
         self.l2_backend = l2_kind if l2_kind in ("xgb","mlp") else None
         self.l2_model = l2_model
         self.l3 = l3_model
         self.l3_temp = TemperatureScaler()
-        # calibrate l3
         try:
-            l3_val_logits = _l3_infer_logits(self.l3, X_l2_val, device=self.device) if hasattr(self, "l3") and self.l3 is not None else np.zeros((len(y_val),1))
+            l3_val_logits = self._l3_infer_logits(self.l3, X_l2_val, device=self.device) if self.l3 is not None else np.zeros((len(y_val),1))
             self.l3_temp.fit(l3_val_logits, y_val)
         except Exception as e:
             logger.warning("L3 temp fit failed: %s", e)
 
-        # metadata
         self.metadata = {
             "l1_hist": l1_hist,
             "l2_meta": l2_meta,
@@ -657,42 +659,68 @@ if torch is not None:
             "l1_seq_len": l1_seq_len
         }
         self._fitted = True
-        logger.info("Cascade fit completed")
+        logger.info("Cascade.fit completed")
         return self
 
-    def _l3_infer_logits(self, model, X, device):
-        model.eval()
-        logits = []
-        with torch.no_grad():
-            for i in range(0, len(X), 2048):
-                xb = torch.tensor(X[i:i+2048], dtype=torch.float32, device=device)
-                logit = model(xb)
-                if isinstance(logit, tuple): logit = logit[0]
-                logits.append(logit.detach().cpu().numpy())
-        return np.concatenate(logits, axis=0).reshape(-1,1)
+    # minimal batch predict: returns DataFrame of p1,p2,p3 and level gating masks
+    def predict_batch_simple(self, df: pd.DataFrame, t_indices: np.ndarray):
+        if not self._fitted:
+            raise RuntimeError("fit first")
+        eng = compute_engineered_features(df)
+        seq_cols = ['open','high','low','close','volume']
+        micro_cols = [c for c in eng.columns if c.startswith(("ret1","tr","vol_","mom_","chanpos_"))]
+        use_cols = [c for c in seq_cols + micro_cols if c in df.columns.union(eng.columns)]
+        feat_seq = pd.concat([df[seq_cols], eng[micro_cols]], axis=1)[use_cols].replace([np.inf,-np.inf],0.0).fillna(0.0)
+        feat_tab = eng[self.tab_feature_names].replace([np.inf,-np.inf],0.0).fillna(0.0)
 
-    # attach methods to SimpleCascade
-    SimpleCascade.fit = cascade_fit
-    SimpleCascade._l3_infer_logits = _l3_infer_logits
-    SimpleCascade._l1_infer_logits_emb_batch = _l1_infer_logits_emb_batch
+        X_seq_all_scaled = self.scaler_seq.transform(feat_seq.values)
+        X_tab_all_scaled = self.scaler_tab.transform(feat_tab.values)
 
-# autofocus update (keeps the Gate adjustments separate, simplified)
+        Xseq = self.to_sequences(X_seq_all_scaled, t_indices, seq_len=self.metadata.get("l1_seq_len", 64))
+        l1_logits, l1_emb = self._l1_infer_logits_emb_batch(self.l1, Xseq, self.device)
+        l1_logits_scaled = self.l1_temp.transform(l1_logits)
+        p1 = 1.0 / (1.0 + np.exp(-l1_logits_scaled)).reshape(-1)
+
+        X_l2 = np.hstack([l1_emb, X_tab_all_scaled[t_indices]])
+        if self.l2_backend == "xgb":
+            p2 = self.l2_model.predict_proba(X_l2)[:,1]
+        else:
+            # torch MLP
+            self.l2_model.eval()
+            probs = []
+            with torch.no_grad():
+                for i in range(0, len(X_l2), 4096):
+                    xb = torch.tensor(X_l2[i:i+4096], dtype=torch.float32, device=self.device)
+                    logit = self.l2_model(xb)
+                    p = torch.sigmoid(logit).cpu().numpy().reshape(-1)
+                    probs.append(p)
+            p2 = np.concatenate(probs, axis=0)
+
+        # p3 for those passed (compute on all but zeros if not passed)
+        p3 = np.zeros_like(p1)
+        go2 = p1 >= 0.0  # not gating here; higher-level gating applied externally
+        if self.l3 is not None:
+            # compute logits for all (simple)
+            l3_logits = self._l3_infer_logits(self.l3, X_l2, device=self.device)
+            l3_logits_scaled = self.l3_temp.transform(l3_logits)
+            p3_vals = 1.0 / (1.0 + np.exp(-l3_logits_scaled)).reshape(-1)
+            p3 = p3_vals
+
+        out = pd.DataFrame({"t": t_indices, "p1": p1, "p2": p2, "p3": p3})
+        return out
+
+# autofocus stub
 def autofocus_update_placeholder():
-    # NOTE: lightweight stub — you can plug your autofocus search here
-    logger.info("Autofocus update placeholder called")
+    logger.info("Autofocus placeholder called")
 
-# Chunk 6/7: robust export_model_and_metadata (uses your provided logic but avoids pickling model objects)
+# Chunk 6/7: export_model_and_metadata (safe)
 def export_model_and_metadata_safe(cascade: SimpleCascade, out_dir_base: str, save_fi: bool = True) -> Dict[str, Any]:
-    """
-    Save models and artifacts in out_dir and produce a portable .pt bundle that contains only
-    serializable metadata and file paths. This avoids trying to pickle live model objects.
-    """
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     base = f"{out_dir_base}_{ts}"
     os.makedirs(base, exist_ok=True)
     paths = {}
     try:
-        # L1: save state_dict
+        # L1 state
         try:
             l1_file = os.path.join(base, f"l1_state_{ts}.pt")
             torch.save(cascade.l1.state_dict(), l1_file)
@@ -710,28 +738,26 @@ def export_model_and_metadata_safe(cascade: SimpleCascade, out_dir_base: str, sa
             logger.exception("Failed to save l1_temp: %s", e)
             paths["l1_temp_error"] = str(e)
 
-        # L2: if xgboost native, save model via its own API; if MLP, save state_dict
+        # L2
         try:
             if cascade.l2_backend == "xgb" and hasattr(cascade.l2_model, "save_model"):
                 l2_file = os.path.join(base, f"l2_xgb_{ts}.json")
                 cascade.l2_model.save_model(l2_file)
                 paths["l2_model"] = l2_file
             else:
-                # MLP or other: save state_dict if torch module
                 if torch is not None and isinstance(cascade.l2_model, nn.Module):
                     l2_file = os.path.join(base, f"l2_mlp_{ts}.pt")
                     torch.save(cascade.l2_model.state_dict(), l2_file)
                     paths["l2_model"] = l2_file
                 else:
-                    # else, try joblib-safe serializable repr (e.g., XGB sklearn wrapper names)
-                    l2_meta_file = os.path.join(base, f"l2_model_{ts}.json")
-                    joblib.dump({"note": "non-serializable model; inspect cascade.l2_model"}, l2_meta_file)
-                    paths["l2_model_note"] = l2_meta_file
+                    l2_note = os.path.join(base, f"l2_note_{ts}.joblib")
+                    joblib.dump({"note":"non-serializable l2_model"}, l2_note)
+                    paths["l2_model_note"] = l2_note
         except Exception as e:
             logger.exception("Failed to save l2 model: %s", e)
             paths["l2_model_error"] = str(e)
 
-        # L3: save state_dict
+        # L3
         try:
             if torch is not None and isinstance(cascade.l3, nn.Module):
                 l3_file = os.path.join(base, f"l3_state_{ts}.pt")
@@ -771,7 +797,7 @@ def export_model_and_metadata_safe(cascade: SimpleCascade, out_dir_base: str, sa
             logger.exception("Failed to save metadata: %s", e)
             paths["metadata_error"] = str(e)
 
-        # Feature importance placeholders: for XGB try to extract importance
+        # feature importance for xgb
         try:
             if cascade.l2_backend == "xgb" and hasattr(cascade.l2_model, "get_booster"):
                 booster = cascade.l2_model.get_booster()
@@ -785,15 +811,14 @@ def export_model_and_metadata_safe(cascade: SimpleCascade, out_dir_base: str, sa
             logger.exception("Failed to save l2 feature importance: %s", e)
             paths["l2_fi_error"] = str(e)
 
-        # Build portable .pt bundle: contain only file paths + simple metadata (no live objects)
+        # portable bundle (metadata + artifact paths)
         try:
             bundle = {
                 "artifact_paths": paths,
                 "metadata": cascade.metadata,
                 "created_at": datetime.utcnow().isoformat(),
             }
-            pt_path = os.path.join(base, f"cascade_bundle_{ts}.pt")
-            # Use joblib to store bundle metadata (safe, no model objects)
+            pt_path = os.path.join(base, f"cascade_bundle_{ts}.joblib")
             joblib.dump(bundle, pt_path)
             paths["pt"] = pt_path
         except Exception as e:
@@ -803,23 +828,20 @@ def export_model_and_metadata_safe(cascade: SimpleCascade, out_dir_base: str, sa
     except Exception as exc:
         logger.exception("Failed to export model artifacts: %s", exc)
         paths["export_error"] = str(exc)
-    # Final verification
     try:
         if "pt" in paths:
-            sz = os.path.getsize(paths["pt"])
-            paths["pt_verification"] = f"{sz} bytes"
+            paths["pt_verification"] = f"{os.path.getsize(paths['pt'])} bytes"
     except Exception as e:
         paths["pt_verification_error"] = str(e)
     return paths
 
-# Chunk 7/7: Streamlit main pipeline + handlers
+# Chunk 7/7: Streamlit main flow + handlers
 st.markdown("## Run pipeline")
 run_pipeline = st.button("Run Full Pipeline: Fetch → Train → Sweep → Export")
 
 log_container = st.empty()
 log_buf = []
-
-def log(msg, level="info"):
+def log(msg):
     ts = datetime.utcnow().isoformat()
     log_buf.append(f"[{ts}] {msg}")
     log_container.text("\n".join(log_buf[-200:]))
@@ -838,7 +860,6 @@ if run_pipeline:
         health = calculate_health_gauge(daily)
         log("Computed HealthGauge.")
 
-        # candidates
         bars["rvol"] = compute_rvol(bars, lookback=20)
         cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
         log(f"Generated {len(cands)} candidates.")
@@ -846,29 +867,27 @@ if run_pipeline:
             st.error("No candidates generated.")
             raise SystemExit()
 
-        # attach a lightweight 'signal' column scaled 0..10 using a simple heuristic (here pred_prob placeholder)
-        # For now create a proxy signal: atr-normalized inverse (small ATR => stronger signal)
+        # Make a simple proxy signal (0..10) — you can replace with model scores later
         cands["signal"] = ((1.0 / (1.0 + cands["atr"])) * 10).clip(0,10)
 
-        # apply exclusive-level selection: mark each candidate level membership
+        # exclusive level assignment: L3 -> L2 -> L1 -> OUT
         def assign_level(sig):
-            if lvl3_buy_min <= sig <= lvl3_buy_max and not (lvl3_sell_min <= sig <= lvl3_sell_max):
+            if (lvl3_buy_min <= sig <= lvl3_buy_max) and not (lvl3_sell_min <= sig <= lvl3_sell_max):
                 return "L3"
-            if lvl2_buy_min <= sig <= lvl2_buy_max and not (lvl2_sell_min <= sig <= lvl2_sell_max):
+            if (lvl2_buy_min <= sig <= lvl2_buy_max) and not (lvl2_sell_min <= sig <= lvl2_sell_max):
                 return "L2"
-            if lvl1_buy_min <= sig <= lvl1_buy_max and not (lvl1_sell_min <= sig <= lvl1_sell_max):
+            if (lvl1_buy_min <= sig <= lvl1_buy_max) and not (lvl1_sell_min <= sig <= lvl1_sell_max):
                 return "L1"
             return "OUT"
         cands["level"] = cands["signal"].apply(assign_level)
         log("Assigned candidate levels (exclusive).")
         st.write("Candidates head:", cands.head())
 
-        # build events DataFrame for training (simple: use candidate label)
+        # prepare events for training: 't' indexes into rows (simple mapping)
         events = cands.reset_index(drop=True).reset_index().rename(columns={"index":"t"})
         events = events[["t","label"]].rename(columns={"label":"y"})
         log(f"Prepared events (N={len(events)}) for training.")
 
-        # instantiate cascade and fit
         cascade = SimpleCascade(device=device_choice)
         st.info("Training cascade (L1/L2/L3). This may take a while.")
         log("Starting training...")
@@ -876,21 +895,17 @@ if run_pipeline:
         log("Cascade trained.")
         st.success("Cascade trained.")
 
-        # Predict head (sample)
+        # quick sample predictions
         try:
-            sample_idx = events["t"].values[:10]
-            # We'll do inference in a simplified manner (not full predict_batch here)
-            log("Producing sample predictions (L1 logits)...")
-            # produce sequences and call L1 inference helper
-            # reuse code from chunk but call l1 inference directly
-            # For brevity show just shapes
-            st.write("Model metadata:", cascade.metadata)
-        except Exception:
-            logger.exception("Prediction sample failed")
+            sample_idx = events["t"].values[:20]
+            preds = cascade.predict_batch_simple(bars, sample_idx)
+            st.subheader("Predictions (sample)")
+            st.dataframe(preds.head(20))
+        except Exception as e:
+            logger.exception("Sample prediction failed: %s", e)
 
-        # Run a light grid sweep
         st.info("Running grid sweep (light)")
-        rr_vals = [lvl1_buy_min/1.0, lvl2_buy_min/1.0, lvl3_buy_min/1.0]
+        rr_vals = [lvl1_buy_min, lvl2_buy_min, lvl3_buy_min]
         rr_vals = sorted(list(set([float(round(x,2)) for x in rr_vals if x is not None])))
         sl_ranges = [(float(lvl1_sell_min), float(lvl1_sell_max)),
                      (float(lvl2_sell_min), float(lvl2_sell_max)),
@@ -898,7 +913,6 @@ if run_pipeline:
         mpt_list = [float(p_fast), float(p_slow), float(p_deep)]
         sweep_results = run_grid_sweep(clean=cands, bars=bars, rr_vals=rr_vals, sl_ranges=sl_ranges, mpt_list=mpt_list, feature_cols=["atr","rvol","duration"], model_train_kwargs={"max_bars":60})
         st.success("Sweep completed.")
-        # summarize sweep
         summary_rows = []
         for k,v in sweep_results.items():
             if isinstance(v, dict) and "overlay" in v and not v["overlay"].empty:
@@ -907,17 +921,17 @@ if run_pipeline:
                     r = s.iloc[0].to_dict(); r.update({"config":k, "trades_count": v.get("trades_count",0)}); summary_rows.append(r)
         if summary_rows:
             sdf = pd.DataFrame(summary_rows).sort_values("total_pnl", ascending=False).reset_index(drop=True)
+            st.subheader("Sweep summary (top configs)")
             st.dataframe(sdf.head(20))
+            st.download_button("Download sweep summary CSV", data=sdf.to_csv(index=False).encode(), file_name="sweep_summary.csv", mime="text/csv")
         else:
             st.warning("Sweep returned no runs with trades.")
 
-        # Export artifacts
+        # export artifacts
         st.info("Exporting artifacts and .pt bundles")
-        out_base = f"artifacts"
-        out_paths = export_model_and_metadata_safe(cascade, out_base, save_fi=save_pt)
-        st.write("Exported models to", os.path.dirname(list(out_paths.get("pt", out_paths.get("metadata","artifacts")))))
+        out_paths = export_model_and_metadata_safe(cascade, out_dir_base="artifacts", save_fi=save_pt)
+        st.write("Export results:")
         st.json(out_paths)
-
         st.success("Full pipeline completed.")
     except Exception as exc:
         logger.exception("Pipeline failed: %s", exc)
