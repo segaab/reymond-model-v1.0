@@ -977,3 +977,96 @@ else:
             raise RuntimeError("Torch not available. Install PyTorch to use CascadeTrader.")
 
 # End preserved training block.
+
+
+# Chunk 8/8: UI actions & notes
+
+if run_full_pipeline_btn:
+    with st.spinner("Running full pipeline (fetch→cands→train→export) … this may take several minutes"):
+        result = run_full_pipeline()
+        if result is None:
+            st.error("Pipeline failed with no result.")
+        elif "error" in result:
+            st.error(f"Pipeline error: {result.get('error')} - {result.get('exception','')}")
+        else:
+            st.success("Full pipeline completed.")
+            st.write("Artifacts saved:", st.session_state.export_paths)
+            if run_breadth and "last_breadth" in st.session_state:
+                br = st.session_state.last_breadth
+                st.subheader("Breadth detailed results")
+                for lvl, df in br["detailed"].items():
+                    st.write(lvl, len(df))
+                    if not df.empty:
+                        st.dataframe(df.head(20))
+
+# manual breadth run
+if run_breadth:
+    bars = st.session_state.get("bars", pd.DataFrame())
+    if bars.empty:
+        bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
+        bars = ensure_unique_index(bars)
+    cands = st.session_state.get("cands", pd.DataFrame())
+    if cands.empty:
+        cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+    if cands is None or cands.empty:
+        st.error("No candidates available for breadth run.")
+    else:
+        if "pred_prob" not in cands.columns:
+            cands["pred_prob"] = 0.0
+        res = run_breadth_backtest(clean=cands, bars=bars,
+                                   levels_config={
+                                       "L1": {"buy_th": float(lvl1_buy_min), "sell_th": float(lvl1_sell_max), "rr_min": float(lvl1_rr_min), "rr_max": float(lvl1_rr_max), "sl_min": float(lvl1_sl_min), "sl_max": float(lvl1_sl_max)},
+                                       "L2": {"buy_th": float(lvl2_buy_min), "sell_th": float(lvl2_sell_max), "rr_min": float(lvl2_rr_min), "rr_max": float(lvl2_rr_max), "sl_min": float(lvl2_sl_min), "sl_max": float(lvl2_sl_max)},
+                                       "L3": {"buy_th": float(lvl3_buy_min), "sell_th": float(lvl3_sell_max), "rr_min": float(lvl3_rr_min), "rr_max": float(lvl3_rr_max), "sl_min": float(lvl3_sl_min), "sl_max": float(lvl3_sl_max)}
+                                   },
+                                   feature_cols=["atr","rvol","duration","hg"],
+                                   model_train_kwargs={"max_bars":60})
+        summary_df = pd.DataFrame(res.get("summary", []))
+        st.subheader("Breadth Summary")
+        if not summary_df.empty:
+            st.dataframe(summary_df)
+        else:
+            st.warning("Breadth run returned no summary rows.")
+        detailed = res.get("detailed_trades", {})
+        for lvl, df in detailed.items():
+            st.subheader(f"{lvl} — {len(df)} trades")
+            if not df.empty:
+                st.dataframe(df.head(50))
+
+# manual sweep
+if run_sweep_btn:
+    bars = st.session_state.get("bars", pd.DataFrame())
+    if bars.empty:
+        bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
+        bars = ensure_unique_index(bars)
+    cands = st.session_state.get("cands", pd.DataFrame())
+    if cands.empty:
+        cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+    if cands is None or cands.empty:
+        st.error("No candidates for sweep.")
+    else:
+        rr_vals = [lvl1_rr_min, lvl1_rr_max, lvl2_rr_min, lvl2_rr_max, lvl3_rr_min, lvl3_rr_max]
+        rr_vals = sorted(list(set([float(round(x, 2)) for x in rr_vals if x is not None])))
+        sl_ranges = [(float(lvl1_sl_min), float(lvl1_sl_max)), (float(lvl2_sl_min), float(lvl2_sl_max)), (float(lvl3_sl_min), float(lvl3_sl_max))]
+        mpt_list = [float(p_fast), float(p_slow), float(p_deep)]
+        try:
+            sweep_results = run_grid_sweep(clean=cands, bars=bars, rr_vals=rr_vals, sl_ranges=sl_ranges, mpt_list=mpt_list, feature_cols=["atr","rvol","duration","hg"], model_train_kwargs={"max_bars":60})
+            summary_rows = []
+            for k, v in sweep_results.items():
+                if isinstance(v, dict) and "overlay" in v and not v["overlay"].empty:
+                    s = summarize_trades(v["overlay"])
+                    if not s.empty:
+                        r = s.iloc[0].to_dict(); r.update({"config": k, "trades_count": v.get("trades_count", 0)})
+                        summary_rows.append(r)
+            if summary_rows:
+                sdf = pd.DataFrame(summary_rows).sort_values("total_pnl", ascending=False).reset_index(drop=True)
+                st.subheader("Sweep summary (top configs)")
+                st.dataframe(sdf.head(20))
+                st.download_button("Download sweep summary CSV", df_to_csv_bytes(sdf), "sweep_summary.csv", "text/csv")
+            else:
+                st.warning("Sweep returned no runs with trades.")
+        except Exception as exc:
+            logger.exception("Sweep failed: %s", exc)
+            st.error(f"Sweep failed: {exc}")
+
+st.sidebar.markdown("### Notes\n- Use 'Run full pipeline' to fetch data, generate candidates, train cascade, run breadth/sweep (optional) and export artifacts (.pt bundles).\n- Breadth and sweep can also be run manually using the sidebar buttons.\n- Exports are saved under the current working directory in an artifacts_YYYYMMDDT... folder.")
