@@ -1,3 +1,5 @@
+
+
 # app.py — Chunk 1/7
 import os
 import io
@@ -102,6 +104,7 @@ run_sweep = st.sidebar.checkbox("Enable grid sweep (on full run)", value=False)
 st.sidebar.header("Run pipeline")
 run_full_pipeline_btn = st.sidebar.button("Run full pipeline (fetch → train → export)")
 
+
 # Chunk 2/7: features, sequences, and dataset classes
 
 def compute_engineered_features(df: pd.DataFrame, windows=(5,10,20)) -> pd.DataFrame:
@@ -178,6 +181,8 @@ else:
     # Provide no-op placeholders to avoid NameError in non-train flows
     SequenceDataset = None
     TabDataset = None
+
+
 # Chunk 3/7: candidate generation, simulation and summarization
 
 def ensure_unique_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -322,7 +327,6 @@ def summarize_trades(trades: pd.DataFrame) -> pd.DataFrame:
         "end_time": end_time
     }])
 
-
 # Chunk 4/7: model building blocks and temperature scaler
 
 if torch is None:
@@ -419,7 +423,6 @@ else:
                 logits_t = torch.tensor(logits.reshape(-1,1), dtype=torch.float32, device=device)
                 scaled = self.forward(logits_t).cpu().numpy()
             return scaled.reshape(-1)
-
 # Chunk 5/7: training helpers and CascadeTrader (fit + predict) with parallel L2/L3 training
 
 def _device(name: str) -> torch.device:
