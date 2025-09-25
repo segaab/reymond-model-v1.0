@@ -13,6 +13,7 @@ tqdm
 supabase
 python-dotenv
 torch
+plotly
 
 requests
 sqlalchemy
