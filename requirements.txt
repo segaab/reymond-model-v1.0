@@ -16,3 +16,8 @@ torch
 
 requests
 sqlalchemy
+ 
+pyts 
+torchvision 
+optuna
+mpmath
