@@ -205,8 +205,16 @@ def simulate_simple_strategy(underlying_df, option_contracts_df, trades_df_by_sy
                 break
     candidate['strike'] = pd.to_numeric(candidate.get('strike', np.nan), errors='coerce')
     candidate['strike_diff'] = abs(candidate['strike'] - S)
+    
+    # FIX: Check if candidate DataFrame is empty before attempting to sort and access rows
+    sorted_candidates = candidate.sort_values('strike_diff', na_position='last')
+    if sorted_candidates.empty:
+        return {"pnl": 0.0, "paid": 0.0, "received": 0.0, 
+                "call_sym": None, "put_sym": None, 
+                "note": "no_suitable_options_found"}
+                
     # pick ATM row
-    atm_row = candidate.sort_values('strike_diff', na_position='last').iloc[0]
+    atm_row = sorted_candidates.iloc[0]
     atm_strike = atm_row.get('strike', None)
 
     # find call/put symbols robustly
@@ -305,7 +313,7 @@ def simulate_simple_strategy(underlying_df, option_contracts_df, trades_df_by_sy
         target_ts = pd.to_datetime(ts_ms, unit='ms')
         df = df.dropna(subset=['__ts'])
         idx = (df['__ts'] - target_ts).abs().argsort()
-        if idx.empty:
+        if len(idx) == 0:  # Defensive check
             return np.nan
         row = df.iloc[idx[0]]
         val = row.get(price_col, np.nan)
@@ -348,7 +356,7 @@ def simulate_simple_strategy(underlying_df, option_contracts_df, trades_df_by_sy
 # ---------------------------
 # STREAMLIT UI
 # ---------------------------
-st.title("Options Event Backtester — Event-driven strategies + cascading NN entry")
+st.title("Options Event Backtester -- Event-driven strategies + cascading NN entry")
 
 with st.sidebar:
     st.header("Config")
@@ -434,9 +442,3 @@ with col2:
             st.json(result)
 
 st.markdown("---")
-st.subheader("Notes & next steps")
-st.write("""
-- This prototype uses trade-level data as a nearest-trade proxy for mid prices; to produce production-quality fills, use real NBBO bid/ask snapshots or orderbook-level data and incorporate slippage/market impact models.
-threshold are simulated.
-- For live use, persist cached contracts/trades and add a retraining scheduler for the cascade model.
-""")
