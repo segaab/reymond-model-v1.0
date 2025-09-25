@@ -19,12 +19,11 @@ from scipy.optimize import brentq
 # CONFIG / HELPERS
 # ---------------------------
 POLY_BASE = "https://api.polygon.io"
-API_KEY = os.getenv("POLYGON_API_KEY", "")  # fallback to UI input if empty
+API_KEY = "6TeqTIlpZNcY4nVzdFq37cpMjUCe8ZYA"  # hardcoded
 
 st.set_page_config(layout="wide", page_title="Options Event Backtester", initial_sidebar_state="expanded")
 
 def bs_price(cp_flag, S, K, r, q, sigma, t):
-    """Black-Scholes price (European). cp_flag='c' or 'p' """
     if t <= 0:
         return max(0.0, (S - K) if cp_flag=='c' else (K-S))
     d1 = (math.log(S/K) + (r - q + 0.5*sigma*sigma)*t) / (sigma*math.sqrt(t))
@@ -35,7 +34,6 @@ def bs_price(cp_flag, S, K, r, q, sigma, t):
         return K*math.exp(-r*t)*norm.cdf(-d2) - S*math.exp(-q*t)*norm.cdf(-d1)
 
 def implied_vol(cp_flag, S, K, r, q, t, market_price, tol=1e-6, maxiter=100):
-    """Brent solver for implied vol"""
     if market_price <= 0:
         return 0.0
     func = lambda vol: bs_price(cp_flag, S, K, r, q, vol, t) - market_price
@@ -44,7 +42,6 @@ def implied_vol(cp_flag, S, K, r, q, t, market_price, tol=1e-6, maxiter=100):
     except Exception:
         return np.nan
 
-# caching wrapper for Polygon requests
 @st.cache_data(show_spinner=False)
 def polygon_get(path, params=None, base=POLY_BASE):
     if params is None: params = {}
@@ -60,19 +57,19 @@ def polygon_get(path, params=None, base=POLY_BASE):
 # POLYGON ETL FUNCTIONS
 # ---------------------------
 def get_underlying_aggregates(ticker, from_dt, to_dt, timespan='1/day'):
-    # use v2/aggs/ticker for daily aggregates
     path = f"/v2/aggs/ticker/{ticker}/range/1/day/{from_dt}/{to_dt}"
     res = polygon_get(path)
     if not res or 'results' not in res:
         return pd.DataFrame()
     df = pd.DataFrame(res['results'])
     df['t'] = pd.to_datetime(df['t'], unit='ms')
-    df = df.rename(columns={'o':'open','h':'high','l':'low','c':'close','v':'volume'})
-    return df[['t','open','high','low','close','volume','v']]
+    df = df.rename(columns={'o':'open','h':'high','l':'low','c':'close','v':'volume','vw':'vwap'})
+    if 'vwap' not in df.columns:
+        df['vwap'] = np.nan
+    return df[['t','open','high','low','close','volume','vwap']]
 
 @st.cache_data(show_spinner=False)
 def get_option_contracts(ticker, expiration_gte=None, expiration_lte=None, limit=1000):
-    # v3 reference options
     path = "/v3/reference/options/contracts"
     params = {'underlying_ticker': ticker, 'limit': limit}
     if expiration_gte: params['expiration_date.gte'] = expiration_gte
@@ -84,7 +81,6 @@ def get_option_contracts(ticker, expiration_gte=None, expiration_lte=None, limit
 
 @st.cache_data(show_spinner=False)
 def get_option_trades(option_symbol, start_ms, end_ms, limit=5000):
-    # note: polygon returns paginated results; implement a simple loop with next_url if available
     path = f"/v3/trades/{option_symbol}"
     params = {'timestamp.gte': start_ms, 'timestamp.lte': end_ms, 'limit': limit}
     res = polygon_get(path, params)
@@ -99,37 +95,23 @@ def get_option_trades(option_symbol, start_ms, end_ms, limit=5000):
 def simulate_simple_strategy(underlying_df, option_contracts_df, trades_df_by_symbol,
                              strategy='straddle', entry_date=None, exit_days=7,
                              capital=10000, fee_per_trade=1.0, slippage=0.01):
-    """
-    Very conservative simulation:
-    - Entry: take mid-price at entry timestamp for the option contracts of selected strikes/expiry
-    - Exit: close at mid-price at exit timestamp
-    - Does not perform order book modelling; uses trade-level data if available to compute mid.
-    """
-    # select expiry nearest > exit_days
-    # For brevity: use contracts_df, pick ATM strikes at entry_date for expiry ~ exit_days
     S_row = underlying_df[underlying_df['t'].dt.date == entry_date.date()]
     if S_row.empty:
         S = underlying_df.iloc[-1]['close']
     else:
         S = float(S_row.iloc[0]['close'])
-    # pick expiry about exit_days ahead
     option_contracts_df['expiration_date'] = pd.to_datetime(option_contracts_df['expiration_date'])
     target_exp = entry_date + timedelta(days=exit_days)
     candidate = option_contracts_df.iloc[((option_contracts_df['expiration_date'] - pd.Timestamp(entry_date)).abs()).argsort()][:200]
-    # ATM strike
     candidate['strike_diff'] = abs(candidate['strike'] - S)
     atm = candidate.sort_values('strike_diff').iloc[0]
     atm_strike = atm['strike']
-    # build a straddle: buy call + buy put ATM
     call_sym = atm['symbol'] if atm['type']=='call' else candidate[(candidate['type']=='call') & (candidate['strike']==atm_strike)].iloc[0]['symbol']
     put_sym = atm['symbol'] if atm['type']=='put' else candidate[(candidate['type']=='put') & (candidate['strike']==atm_strike)].iloc[0]['symbol']
-    # get mid price at entry and exit
     def mid_at(symbol, ts_ms):
-        # if trades available, use nearest trade as proxy
         if symbol in trades_df_by_symbol:
             df = trades_df_by_symbol[symbol]
             df['ts'] = pd.to_datetime(df['t'], unit='ms')
-            # nearest trade
             near = df.iloc[(df['ts'] - pd.Timestamp(ts_ms, unit='ms')).abs().argsort()[:1]]
             if not near.empty:
                 return float(near.iloc[0]['p'])
@@ -140,8 +122,7 @@ def simulate_simple_strategy(underlying_df, option_contracts_df, trades_df_by_sy
     put_entry_p  = mid_at(put_sym, entry_ms) * (1 + slippage)
     call_exit_p = mid_at(call_sym, exit_ms) * (1 - slippage)
     put_exit_p  = mid_at(put_sym, exit_ms) * (1 - slippage)
-    # if nan, fallback to last trade before timestamp or to theoretical BS price - omitted for brevity
-    paid = (call_entry_p + put_entry_p) * 100  # 100 multiplier
+    paid = (call_entry_p + put_entry_p) * 100
     received = (call_exit_p + put_exit_p) * 100
     pnl = received - paid - fee_per_trade*2
     return {"pnl": pnl, "paid": paid, "received": received, "call_sym": call_sym, "put_sym": put_sym}
@@ -153,9 +134,6 @@ st.title("Options Event Backtester — Event-driven strategies + cascading NN en
 
 with st.sidebar:
     st.header("Config")
-    api_input = st.text_input("Polygon API key (or set POLYGON_API_KEY env var)", value=API_KEY if API_KEY else "")
-    if api_input:
-        API_KEY = api_input.strip()
     ticker = st.text_input("Underlying ticker", value="PARA")
     event_date = st.date_input("Event anchor date", value=datetime(2025,8,7).date())
     before_days = st.slider("Days before event to pull", 1, 60, 14)
@@ -175,12 +153,10 @@ with col1:
         st.info(f"Pulling underlying daily aggregates {start_dt.date()} → {end_dt.date()} (may take some seconds)")
         underlying = get_underlying_aggregates(ticker, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
         st.write("Underlying samples:", underlying.shape)
-        # fetch option contracts for window
         opt_df = get_option_contracts(ticker, expiration_gte=start_dt.strftime("%Y-%m-%d"),
                                       expiration_lte=end_dt.strftime("%Y-%m-%d"), limit=1000)
         st.write("Option contracts sample:", opt_df.shape)
         st.dataframe(opt_df.head(10))
-        # pick top 5 contracts by open_interest if available and fetch trade data
         if 'open_interest' in opt_df.columns:
             top = opt_df.sort_values('open_interest', ascending=False).head(10)
         else:
@@ -189,7 +165,6 @@ with col1:
         st.write("Fetching trade samples for top contracts (may be rate-limited)...")
         for sym in top['symbol'].unique():
             try:
-                # naive: pull trades for event date only (+some slack)
                 start_ms = int((datetime.combine(event_date, datetime.min.time()) - timedelta(hours=2)).timestamp()*1000)
                 end_ms = int((datetime.combine(event_date, datetime.min.time()) + timedelta(hours=6)).timestamp()*1000)
                 df_tr = get_option_trades(sym, start_ms, end_ms)
@@ -202,7 +177,6 @@ with col1:
         st.session_state['opt_df'] = opt_df
         st.session_state['trades'] = trades
 
-    # show preloaded data (if present)
     if 'underlying' in st.session_state:
         u = st.session_state['underlying']
         fig = go.Figure()
@@ -228,6 +202,6 @@ st.markdown("---")
 st.subheader("Notes & next steps")
 st.write("""
 - This prototype uses trade-level data as a nearest-trade proxy for mid prices; to produce production-quality fills, use real NBBO bid/ask snapshots or orderbook-level data and incorporate slippage/market impact models.
-- The cascading NN inference (not included inline for brevity) plugs into the 'Quick Strategy Run' stage: the model scores candidate trades and only trades above a threshold are simulated.
-- For live use, persist cached contracts/trades and add a retraining scheduler for the cascade model.
+- The cascading NN inference (not included inline for brevity) plugs into the 'Quick Strategy Run' stage.
+- Persist cached contracts/trades for repeated runs and add a retraining scheduler for the cascade model.
 """)
