@@ -1,3 +1,4 @@
+
 # app.py — Entry-Range Triangulation (integrated single-file)
 # Chunk 1/8: imports + Streamlit UI + level configs + data fetcher
 
@@ -14,16 +15,18 @@ import pickle
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any, Optional
+from collections import deque
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 # ML / metrics
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler  # <-- Added per fix
 
 # Optional libs (graceful degradation)
 try:
@@ -147,7 +150,6 @@ def fetch_price(symbol: str, start: Optional[str] = None, end: Optional[str] = N
     except Exception as exc:
         logger.error("fetch_price failed: %s", exc)
         return pd.DataFrame()
-
 # Chunk 2/8: features + labeling
 
 def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
@@ -329,8 +331,6 @@ def combine_summaries(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
-
-
 # Chunk 4/8: model training (xgboost), prediction and export helpers
 
 class BoosterWrapper:
@@ -554,7 +554,6 @@ class L3Wrapper:
         self.model = model
     def feature_importance(self):
         return pd.DataFrame([{"feature": "l3_emb", "gain": 1.0}])
-
 
 # Chunk 5/8: CascadeTrader and models (from your cascade_trader.py content)
 
@@ -796,7 +795,7 @@ class TemperatureScaler(nn.Module):
             device = next(self.parameters()).device
             logits_t = torch.tensor(logits, dtype=torch.float32, device=device)
             scaled = self.forward(logits_t).cpu().numpy()
-        return scaled
+        return scaled/
 
 # Chunk 6/8: Training helpers, L2 fallback MLP, and CascadeTrader wrapper
 
@@ -970,6 +969,7 @@ class CascadeTrader:
         self.autofocus_buffer = deque(maxlen=2000)
         self._fitted = False
         self.metadata: Dict[str, Any] = {}
+
 
 # Chunk 7/8: breadth/sweep, supabase logger, helpers, session state init
 
@@ -1349,4 +1349,3 @@ if run_full_pipeline_btn:
                     st.write(lvl, len(df))
                     if not df.empty:
                         st.dataframe(df.head(20))
-
